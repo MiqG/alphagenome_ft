@@ -147,7 +147,7 @@ def _shard_batch(batch: Mapping[str, jax.Array], num_devices: int):
         per_device_batch = value.shape[0] // num_devices
         return value.reshape((num_devices, per_device_batch, *value.shape[1:]))
 
-    return {name: shard_array(name, value) for name, value in batch.items()}
+    return {name: shard_array(value) for name, value in batch.items()}
 
 
 def train(

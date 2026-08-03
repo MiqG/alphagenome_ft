@@ -70,6 +70,28 @@ def mock_fasta(tmp_path: Path) -> str:
     return str(path)
 
 
+# Splice heads need real 1bp decoder embeddings, which use_encoder_output=True
+# (skips the transformer/decoder) doesn't provide — so the end-to-end smoke
+# tests need the full model, which in turn needs a real supported sequence
+# length (16384, matching create_model_with_heads's own init_seq_len default).
+FULL_MODEL_SEQUENCE_LENGTH = 16384
+
+
+@pytest.fixture()
+def mock_fasta_full(tmp_path: Path) -> str:
+    """A single-chromosome FASTA long enough for a real (non-encoder-only) forward pass."""
+    import pyfaidx
+
+    seq = "ACGT" * ((FULL_MODEL_SEQUENCE_LENGTH // 4) + 10)
+    path = tmp_path / "mock_genome_full.fa"
+    lines = [">chr1"]
+    for i in range(0, len(seq), 70):
+        lines.append(seq[i : i + 70])
+    path.write_text("\n".join(lines) + "\n")
+    pyfaidx.Faidx(str(path))
+    return str(path)
+
+
 class TestStarJunctionsParser:
     def test_read_star_junctions(self, star_junction_files):
         df = sj.read_star_junctions(star_junction_files[0])
@@ -342,11 +364,11 @@ class TestSpliceTrainingSmoke:
     """End-to-end smoke test: real pretrained checkpoint + one train() step."""
 
     def test_one_train_step_all_splice_heads(
-        self, tmp_path, star_junction_files, mock_fasta, device
+        self, tmp_path, star_junction_files, mock_fasta_full, device
     ):
         require_kaggle_credentials()
         from alphagenome_ft import create_model_with_heads, register_predefined_head
-        from alphagenome_ft.finetune import train as ft_train
+        from alphagenome_ft.finetune.train import register_predefined_heads, train as run_train
         from alphagenome.data import genome as genome_lib
 
         head_kinds = {
@@ -379,20 +401,21 @@ class TestSpliceTrainingSmoke:
         }
         specs = ft_config.prepare_head_specs(cfg, organism="HOMO_SAPIENS")
         ft_config.validate_head_specs(specs)
-        ft_train.register_predefined_heads(specs)
+        register_predefined_heads(specs)
 
         model = create_model_with_heads(
             "all_folds",
             heads=[s.head_id for s in specs],
             device=device,
-            use_encoder_output=True,
-            init_seq_len=5000,
+            init_seq_len=FULL_MODEL_SEQUENCE_LENGTH,
         )
 
-        windows = [genome_lib.Interval(chromosome="chr1", start=0, end=5000)]
+        windows = [
+            genome_lib.Interval(chromosome="chr1", start=0, end=FULL_MODEL_SEQUENCE_LENGTH)
+        ]
         data_module = SpliceDataModule(
             intervals={"train": windows, "valid": windows},
-            fasta_path=mock_fasta,
+            fasta_path=mock_fasta_full,
             star_junction_files=star_junction_files,
             head_kinds=head_kinds,
             batch_size=1,
@@ -401,7 +424,7 @@ class TestSpliceTrainingSmoke:
             max_splice_sites=16,
         )
 
-        ft_train.train(
+        run_train(
             model,
             data_module,
             specs,
@@ -415,14 +438,14 @@ class TestSpliceTrainingSmoke:
 
     @pytest.mark.parametrize("heads_only", [True, False])
     def test_one_train_step_predicted_junction_positions(
-        self, star_junction_files, mock_fasta, device, heads_only,
+        self, star_junction_files, mock_fasta_full, device, heads_only,
     ):
         """Predicted mode must be correct with and without a frozen backbone —
         that's the whole point of rebuilding the target matrix as a pure JAX
         op instead of a host/pandas round-trip (see splice_positions.py)."""
         require_kaggle_credentials()
         from alphagenome_ft import create_model_with_heads
-        from alphagenome_ft.finetune import train as ft_train
+        from alphagenome_ft.finetune.train import register_predefined_heads, train as run_train
         from alphagenome.data import genome as genome_lib
 
         head_kinds = {
@@ -451,20 +474,21 @@ class TestSpliceTrainingSmoke:
         }
         specs = ft_config.prepare_head_specs(cfg, organism="HOMO_SAPIENS")
         ft_config.validate_head_specs(specs)
-        ft_train.register_predefined_heads(specs)
+        register_predefined_heads(specs)
 
         model = create_model_with_heads(
             "all_folds",
             heads=[s.head_id for s in specs],
             device=device,
-            use_encoder_output=True,
-            init_seq_len=5000,
+            init_seq_len=FULL_MODEL_SEQUENCE_LENGTH,
         )
 
-        windows = [genome_lib.Interval(chromosome="chr1", start=0, end=5000)]
+        windows = [
+            genome_lib.Interval(chromosome="chr1", start=0, end=FULL_MODEL_SEQUENCE_LENGTH)
+        ]
         data_module = SpliceDataModule(
             intervals={"train": windows, "valid": windows},
-            fasta_path=mock_fasta,
+            fasta_path=mock_fasta_full,
             star_junction_files=star_junction_files,
             head_kinds=head_kinds,
             batch_size=1,
@@ -475,7 +499,7 @@ class TestSpliceTrainingSmoke:
             max_junctions_per_window=32,
         )
 
-        ft_train.train(
+        run_train(
             model,
             data_module,
             specs,

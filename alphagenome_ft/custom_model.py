@@ -348,7 +348,7 @@ class CustomAlphaGenomeModel:
                 sequences,
                 organism_indices,
                 *,
-                requested_outputs,
+                requested_outputs=None,
                 negative_strand_mask,
                 strand_reindexing,
                 rng=None,

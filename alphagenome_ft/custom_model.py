@@ -82,6 +82,27 @@ from alphagenome_ft import parameter_utils
 from alphagenome_ft import custom_heads as custom_heads_module
 
 
+def _dummy_splice_site_positions(head_names: Sequence[str]):
+    """Dummy ``splice_site_positions`` for param init, if any head needs it.
+
+    ``SpliceSitesJunctionHead.predict`` requires a real ``(B, 4, P)`` int
+    array to trace during Haiku ``init`` (it indexes into it), unlike other
+    heads which only receive it as an unused ``**kwargs`` entry. Returns
+    ``None`` when no registered head is a junction head.
+    """
+    from alphagenome_research.model import heads as research_heads_module
+
+    needs_positions = False
+    for head_name in head_names:
+        config = custom_heads_module.get_registered_head_config(head_name)
+        if getattr(config, 'type', None) == research_heads_module.HeadType.SPLICE_SITES_JUNCTION:
+            needs_positions = True
+            break
+    if not needs_positions:
+        return None
+    return jnp.full((1, 4, 1), -1, dtype=jnp.int32)
+
+
 def _resolve_user_metadata(
     *,
     head_name: str,
@@ -119,6 +140,73 @@ def _resolve_user_metadata(
             f"expected {num_tracks}."
         )
     return {organism: metadata for organism in dna_client.Organism}
+
+
+def _make_head(head_name: str, num_organisms: int) -> custom_heads_module.HeadLike:
+    """Construct a registered head instance (custom or predefined) by name."""
+    head_config = custom_heads_module.get_registered_head_config(head_name)
+    if custom_heads_module.is_custom_config(head_config):
+        return custom_heads_module.create_registered_head(
+            head_name, metadata=None, num_organisms=num_organisms,
+        )
+    head_metadata = _resolve_user_metadata(
+        head_name=head_name, head_config=head_config,
+    ) or {}
+    return custom_heads_module.create_predefined_head_from_config(
+        head_config, metadata=head_metadata,
+    )
+
+
+def _build_head_predictions(
+    head_names: Sequence[str],
+    embeddings: Any,
+    organism_index: Any,
+    splice_site_positions: Any,
+    num_organisms: int,
+) -> dict[str, Any]:
+    """Construct + call each head, running predicted-mode junction heads last.
+
+    A junction head registered with ``junction_position_source="predicted"``
+    (see ``custom_heads_module.register_junction_position_source``) needs its
+    classification head's logits to derive positions
+    (``splice_positions.top_k_splice_positions``), so it must run *after*
+    that classification head. Every other head runs in the caller's order,
+    using the batch-supplied ``splice_site_positions`` (annotated mode, or
+    unused via **kwargs for non-splice heads).
+    """
+    from alphagenome_ft.finetune.splice_positions import top_k_splice_positions
+
+    predicted_junction_heads = [
+        name for name in head_names
+        if custom_heads_module.get_junction_position_source(name) is not None
+    ]
+    regular_heads = [name for name in head_names if name not in predicted_junction_heads]
+
+    predictions: dict[str, Any] = {}
+    for head_name in regular_heads:
+        head = _make_head(head_name, num_organisms)
+        predictions[head_name] = head(
+            embeddings, organism_index, splice_site_positions=splice_site_positions,
+        )
+
+    for head_name in predicted_junction_heads:
+        info = custom_heads_module.get_junction_position_source(head_name)
+        cls_head_name = info['classification_head_id']
+        if cls_head_name not in predictions:
+            raise ValueError(
+                f"Junction head '{head_name}' needs classification head "
+                f"'{cls_head_name}' predictions to derive positions, but it "
+                f"wasn't found among this model's heads: {list(predictions)}."
+            )
+        predicted_positions = top_k_splice_positions(
+            predictions[cls_head_name]['logits'], info['top_k']
+        )
+        head = _make_head(head_name, num_organisms)
+        predictions[head_name] = head(
+            embeddings, organism_index, splice_site_positions=predicted_positions,
+        )
+
+    return predictions
 
 
 class _PredictionsDict:
@@ -264,11 +352,15 @@ class CustomAlphaGenomeModel:
                 negative_strand_mask,
                 strand_reindexing,
                 rng=None,
+                splice_site_positions=None,
             ):
                 # Haiku apply(params, state, rng, ...). Pass a PRNGKey for training (enables head
                 # dropout when configured). Pass None for val/test so heads that wrap dropout in
                 # try/except skip it without raising.
-                result = custom_forward_fn(params, state, rng, sequences, organism_indices)
+                result = custom_forward_fn(
+                    params, state, rng, sequences, organism_indices,
+                    splice_site_positions=splice_site_positions,
+                )
 
                 # Custom forward function may return (predictions_dict, embeddings) tuple or just predictions
                 if isinstance(result, tuple):
@@ -552,8 +644,9 @@ class CustomAlphaGenomeModel:
                     raise TypeError(
                         f"Expected batch mapping for head '{head_name}', got {type(batch)!r}."
                     )
-                # Build a minimal DataBatch for GenomeTracksHead loss.
+                # Build a minimal DataBatch for the head's loss().
                 from alphagenome_research.model import schemas
+                from alphagenome_research.model import heads as research_heads_module
                 from alphagenome_research.io import bundles as bundles_lib
                 import jax.numpy as jnp
 
@@ -564,37 +657,98 @@ class CustomAlphaGenomeModel:
                     )
                 targets = batch['targets']
                 organism_index = batch['organism_index']
-                if not hasattr(head_config, 'bundle') or head_config.bundle is None:
-                    raise ValueError(
-                        f"Predefined head '{head_name}' is missing bundle info."
-                    )
-                bundle = head_config.bundle
-                mask = jnp.ones(
-                    (targets.shape[0], 1, targets.shape[-1]), dtype=bool
-                )
+                splice_site_positions = batch.get('splice_site_positions')
+                raw_junction_events = batch  # keep the original mapping for predicted mode
+                head_type = getattr(head_config, 'type', None)
 
-                data_kwargs: dict[str, Any] = {
-                    'organism_index': organism_index,
-                }
-                if bundle == bundles_lib.BundleName.ATAC:
-                    data_kwargs.update(atac=targets, atac_mask=mask)
-                elif bundle == bundles_lib.BundleName.RNA_SEQ:
-                    data_kwargs.update(rna_seq=targets, rna_seq_mask=mask)
-                elif bundle == bundles_lib.BundleName.DNASE:
-                    data_kwargs.update(dnase=targets, dnase_mask=mask)
-                elif bundle == bundles_lib.BundleName.PROCAP:
-                    data_kwargs.update(procap=targets, procap_mask=mask)
-                elif bundle == bundles_lib.BundleName.CAGE:
-                    data_kwargs.update(cage=targets, cage_mask=mask)
-                elif bundle == bundles_lib.BundleName.CHIP_TF:
-                    data_kwargs.update(chip_tf=targets, chip_tf_mask=mask)
-                elif bundle == bundles_lib.BundleName.CHIP_HISTONE:
-                    data_kwargs.update(chip_histone=targets, chip_histone_mask=mask)
-                else:
-                    raise ValueError(
-                        f"Unsupported bundle {bundle!r} for head '{head_name}'."
+                if head_type == research_heads_module.HeadType.SPLICE_SITES_CLASSIFICATION:
+                    batch = schemas.DataBatch(
+                        organism_index=organism_index, splice_sites=targets
                     )
-                batch = schemas.DataBatch(**data_kwargs)
+                elif head_type == research_heads_module.HeadType.SPLICE_SITES_USAGE:
+                    batch = schemas.DataBatch(
+                        organism_index=organism_index, splice_site_usage=targets
+                    )
+                elif head_type == research_heads_module.HeadType.SPLICE_SITES_JUNCTION:
+                    junction_position_info = custom_heads_module.get_junction_position_source(
+                        head_name
+                    )
+                    if junction_position_info is not None:
+                        # Predicted mode: positions came from the classification head's
+                        # top-k logits at forward time (see _build_head_predictions), so
+                        # the target matrix must be rebuilt against those positions —
+                        # the precomputed annotated-position `targets` doesn't apply.
+                        from alphagenome_ft.finetune.splice_positions import build_junction_matrix
+
+                        positions = predictions.get('splice_site_positions')
+                        if positions is None:
+                            raise ValueError(
+                                f"Predicted-mode junction head '{head_name}' predictions "
+                                "are missing 'splice_site_positions'."
+                            )
+                        required = (
+                            'junction_d_rel', 'junction_a_rel',
+                            'junction_is_pos_strand', 'junction_counts',
+                        )
+                        missing = [k for k in required if k not in raw_junction_events]
+                        if missing:
+                            raise ValueError(
+                                f"Batch for predicted-mode junction head '{head_name}' is "
+                                f"missing raw junction event fields {missing} — build the "
+                                "SpliceDataModule with emit_raw_junction_events=True."
+                            )
+                        targets = build_junction_matrix(
+                            positions,
+                            raw_junction_events['junction_d_rel'],
+                            raw_junction_events['junction_a_rel'],
+                            raw_junction_events['junction_is_pos_strand'],
+                            raw_junction_events['junction_counts'],
+                            max_splice_sites=positions.shape[-1],
+                        )
+                    else:
+                        positions = splice_site_positions
+                        if positions is None:
+                            raise ValueError(
+                                f"Batch for junction head '{head_name}' must include "
+                                "'splice_site_positions'."
+                            )
+                    batch = schemas.DataBatch(
+                        organism_index=organism_index,
+                        splice_junctions=targets,
+                        splice_site_positions=positions,
+                    )
+                else:
+                    if not hasattr(head_config, 'bundle') or head_config.bundle is None:
+                        raise ValueError(
+                            f"Predefined head '{head_name}' is missing bundle info."
+                        )
+                    bundle = head_config.bundle
+                    mask = jnp.ones(
+                        (targets.shape[0], 1, targets.shape[-1]), dtype=bool
+                    )
+
+                    data_kwargs: dict[str, Any] = {
+                        'organism_index': organism_index,
+                    }
+                    if bundle == bundles_lib.BundleName.ATAC:
+                        data_kwargs.update(atac=targets, atac_mask=mask)
+                    elif bundle == bundles_lib.BundleName.RNA_SEQ:
+                        data_kwargs.update(rna_seq=targets, rna_seq_mask=mask)
+                    elif bundle == bundles_lib.BundleName.DNASE:
+                        data_kwargs.update(dnase=targets, dnase_mask=mask)
+                    elif bundle == bundles_lib.BundleName.PROCAP:
+                        data_kwargs.update(procap=targets, procap_mask=mask)
+                    elif bundle == bundles_lib.BundleName.CAGE:
+                        data_kwargs.update(cage=targets, cage_mask=mask)
+                    elif bundle == bundles_lib.BundleName.CHIP_TF:
+                        data_kwargs.update(chip_tf=targets, chip_tf_mask=mask)
+                    elif bundle == bundles_lib.BundleName.CHIP_HISTONE:
+                        data_kwargs.update(chip_histone=targets, chip_histone_mask=mask)
+                    else:
+                        raise ValueError(
+                            f"Unsupported bundle {bundle!r} for head '{head_name}'."
+                        )
+                    batch = schemas.DataBatch(**data_kwargs)
             else:
                 head = custom_heads_module.create_custom_head(
                     head_name,
@@ -2247,7 +2401,7 @@ def create_model_with_heads(
         from alphagenome_ft.embeddings_extended import ExtendedEmbeddings
 
         @hk.transform_with_state
-        def _forward_with_custom_heads(dna_sequence, organism_index):
+        def _forward_with_custom_heads(dna_sequence, organism_index, splice_site_positions=None):
             """Forward pass with encoder output only (no transformer/decoder)."""
             # Apply mixed precision policies to encoder
             with hk.mixed_precision.push_policy(model_lib.AlphaGenome, policy):
@@ -2270,33 +2424,18 @@ def create_model_with_heads(
                             embeddings = _stop_gradient_embeddings(embeddings)
 
             # Run heads (outside alphagenome scope)
-            predictions = {}
             num_organisms = len(metadata)
             with hk.name_scope('head'):
-                for head_name in normalized_heads:
-                    head_config = custom_heads_module.get_registered_head_config(head_name)
-                    if custom_heads_module.is_custom_config(head_config):
-                        head = custom_heads_module.create_registered_head(
-                            head_name,
-                            metadata=None,
-                            num_organisms=num_organisms,
-                        )
-                    else:
-                        head_metadata = _resolve_user_metadata(
-                            head_name=head_name,
-                            head_config=head_config,
-                        ) or {}
-                        head = custom_heads_module.create_predefined_head_from_config(
-                            head_config,
-                            metadata=head_metadata,
-                        )
-                    predictions[head_name] = head(embeddings, organism_index)
+                predictions = _build_head_predictions(
+                    normalized_heads, embeddings, organism_index,
+                    splice_site_positions, num_organisms,
+                )
 
             return predictions, embeddings
     else:
         # Standard forward pass (no encoder output)
         @hk.transform_with_state
-        def _forward_with_custom_heads(dna_sequence, organism_index):
+        def _forward_with_custom_heads(dna_sequence, organism_index, splice_site_positions=None):
             """Forward pass with requested heads only."""
             # Create AlphaGenome trunk (encoder, transformer, decoder)
             # This will use pretrained params for the backbone
@@ -2310,31 +2449,14 @@ def create_model_with_heads(
             if detach_backbone:
                 embeddings = _stop_gradient_embeddings(embeddings)
 
-            # Create predictions dict (only requested heads)
-            predictions = {}
-
             # Run heads
             # Get number of organisms from metadata (should be 2: human and mouse)
             num_organisms = len(metadata)
             with hk.name_scope('head'):
-                for head_name in normalized_heads:
-                    head_config = custom_heads_module.get_registered_head_config(head_name)
-                    if custom_heads_module.is_custom_config(head_config):
-                        head = custom_heads_module.create_registered_head(
-                            head_name,
-                            metadata=None,
-                            num_organisms=num_organisms,
-                        )
-                    else:
-                        head_metadata = _resolve_user_metadata(
-                            head_name=head_name,
-                            head_config=head_config,
-                        ) or {}
-                        head = custom_heads_module.create_predefined_head_from_config(
-                            head_config,
-                            metadata=head_metadata,
-                        )
-                    predictions[head_name] = head(embeddings, organism_index)
+                predictions = _build_head_predictions(
+                    normalized_heads, embeddings, organism_index,
+                    splice_site_positions, num_organisms,
+                )
 
             return predictions, embeddings
 
@@ -2343,8 +2465,11 @@ def create_model_with_heads(
     rng = jax.random.PRNGKey(42)
     dummy_seq = jnp.zeros((1, init_seq_len, 4), dtype=jnp.bfloat16)
     dummy_org = jnp.array([0])
+    dummy_splice_site_positions = _dummy_splice_site_positions(normalized_heads)
 
-    new_params, new_state = _forward_with_custom_heads.init(rng, dummy_seq, dummy_org)
+    new_params, new_state = _forward_with_custom_heads.init(
+        rng, dummy_seq, dummy_org, dummy_splice_site_positions
+    )
     print("✓ Head parameters initialized")
 
     # Merge pretrained backbone params with new head params
@@ -2380,9 +2505,9 @@ def create_model_with_heads(
 
     # Create custom forward function for the model (JIT-compiled for performance and numerical consistency)
     @jax.jit
-    def custom_forward(params, state, rng, dna_sequence, organism_index):
+    def custom_forward(params, state, rng, dna_sequence, organism_index, splice_site_positions=None):
         (predictions, _), _ = _forward_with_custom_heads.apply(
-            params, state, rng, dna_sequence, organism_index
+            params, state, rng, dna_sequence, organism_index, splice_site_positions
         )
         return predictions
 
@@ -2518,7 +2643,7 @@ def add_heads_to_model(
     hk.mixed_precision.set_policy(model_lib.AlphaGenome, policy)
 
     @hk.transform_with_state
-    def _forward_with_added_heads(dna_sequence, organism_index):
+    def _forward_with_added_heads(dna_sequence, organism_index, splice_site_positions=None):
         """Forward pass with added heads appended to standard heads."""
         # Create AlphaGenome with standard heads (will use pretrained params)
         alphagenome = model_lib.AlphaGenome(metadata)
@@ -2530,26 +2655,13 @@ def add_heads_to_model(
         # Get number of organisms from metadata (should be 2: human and mouse)
         num_organisms = len(metadata)
         with hk.name_scope('head'):
-            for head_name in normalized_heads:
-                if head_name in predictions:
-                    continue
-                head_config = custom_heads_module.get_registered_head_config(head_name)
-                if custom_heads_module.is_custom_config(head_config):
-                    head = custom_heads_module.create_registered_head(
-                        head_name,
-                        metadata=None,
-                        num_organisms=num_organisms,
-                    )
-                else:
-                    head_metadata = _resolve_user_metadata(
-                        head_name=head_name,
-                        head_config=head_config,
-                    ) or {}
-                    head = custom_heads_module.create_predefined_head_from_config(
-                        head_config,
-                        metadata=head_metadata,
-                    )
-                predictions[head_name] = head(embeddings, organism_index)
+            added_head_names = [name for name in normalized_heads if name not in predictions]
+            predictions.update(
+                _build_head_predictions(
+                    added_head_names, embeddings, organism_index,
+                    splice_site_positions, num_organisms,
+                )
+            )
 
         return predictions, embeddings
 
@@ -2558,8 +2670,11 @@ def add_heads_to_model(
     rng = jax.random.PRNGKey(42)
     dummy_seq = jnp.zeros((1, 2**17, 4), dtype=jnp.bfloat16)
     dummy_org = jnp.array([0])
+    dummy_splice_site_positions = _dummy_splice_site_positions(normalized_heads)
 
-    new_params, new_state = _forward_with_added_heads.init(rng, dummy_seq, dummy_org)
+    new_params, new_state = _forward_with_added_heads.init(
+        rng, dummy_seq, dummy_org, dummy_splice_site_positions
+    )
     print("✓ Head parameters initialized")
 
     # Merge pretrained parameters with new head parameters
@@ -2595,9 +2710,9 @@ def add_heads_to_model(
 
     # Create custom forward function (JIT-compiled for performance and numerical consistency)
     @jax.jit
-    def custom_forward(params, state, rng, dna_sequence, organism_index):
+    def custom_forward(params, state, rng, dna_sequence, organism_index, splice_site_positions=None):
         (predictions, _), _ = _forward_with_added_heads.apply(
-            params, state, rng, dna_sequence, organism_index
+            params, state, rng, dna_sequence, organism_index, splice_site_positions
         )
         return predictions
 

@@ -19,12 +19,14 @@ from alphagenome_ft import parameter_utils
 from alphagenome_ft.custom_model import CustomAlphaGenomeModel
 from alphagenome_ft.finetune.config import HeadSpec
 from alphagenome_ft.finetune.data import BigWigDataModule, prepare_batch
+from alphagenome_ft.finetune.splice_data import SpliceDataModule
 from alphagenome_ft.optimizer_utils import create_optimizer
 
 
 def register_predefined_heads(head_specs: Sequence[HeadSpec]) -> None:
     """Register predefined heads from parsed head specs."""
     from alphagenome_ft import register_predefined_head
+    from alphagenome_ft.custom_heads import register_junction_position_source
 
     for spec in head_specs:
         if spec.source != "predefined":
@@ -38,6 +40,15 @@ def register_predefined_heads(head_specs: Sequence[HeadSpec]) -> None:
             spec.config,
             metadata=spec.metadata,
         )
+        if (
+            spec.splice_source is not None
+            and spec.splice_source.junction_position_source == "predicted"
+        ):
+            register_junction_position_source(
+                spec.head_id,
+                top_k=spec.splice_source.junction_top_k,
+                classification_head_id=spec.splice_source.classification_head_id,
+            )
 
 
 def _keypath_to_str(path_tuple: tuple) -> str:
@@ -141,7 +152,7 @@ def _shard_batch(batch: Mapping[str, jax.Array], num_devices: int):
 
 def train(
     model: CustomAlphaGenomeModel,
-    data_module: BigWigDataModule,
+    data_module: BigWigDataModule | SpliceDataModule,
     head_specs: Sequence[HeadSpec],
     *,
     learning_rate: float,
@@ -291,6 +302,30 @@ def train(
 
     loss_fns = {name: model.create_loss_fn_for_head(name) for name in head_names}
 
+    def _predict_extra_kwargs(batch):
+        # Only forward splice_site_positions when the batch actually carries it
+        # (splice-junction training runs); other model._predict implementations
+        # (e.g. the raw base model with no custom heads) don't accept this kwarg.
+        if "splice_site_positions" in batch:
+            return {"splice_site_positions": batch["splice_site_positions"]}
+        return {}
+
+    _RAW_JUNCTION_EVENT_KEYS = (
+        "junction_d_rel", "junction_a_rel", "junction_is_pos_strand", "junction_counts",
+    )
+
+    def _head_batch(batch, head_name):
+        head_batch = {
+            "targets": batch[f"targets_{head_name}"],
+            "organism_index": batch["organism_index"],
+        }
+        if "splice_site_positions" in batch:
+            head_batch["splice_site_positions"] = batch["splice_site_positions"]
+        for key in _RAW_JUNCTION_EVENT_KEYS:
+            if key in batch:
+                head_batch[key] = batch[key]
+        return head_batch
+
     @functools.partial(jax.pmap, axis_name="data")
     def train_step(params, state, current_opt_state, batch):
         def loss_fn(current_params):
@@ -301,15 +336,12 @@ def train(
                 batch["organism_index"],
                 negative_strand_mask=batch["negative_strand_mask"],
                 strand_reindexing=batch["strand_reindexing"],
+                **_predict_extra_kwargs(batch),
             )
             total_loss = 0.0
             for head_name in head_names:
                 head_loss_dict = loss_fns[head_name](
-                    predictions[head_name],
-                    {
-                        "targets": batch[f"targets_{head_name}"],
-                        "organism_index": batch["organism_index"],
-                    },
+                    predictions[head_name], _head_batch(batch, head_name)
                 )
                 total_loss = total_loss + head_loss_dict["loss"]
             return total_loss
@@ -330,15 +362,12 @@ def train(
             batch["organism_index"],
             negative_strand_mask=batch["negative_strand_mask"],
             strand_reindexing=batch["strand_reindexing"],
+            **_predict_extra_kwargs(batch),
         )
         head_losses = {}
         for head_name in head_names:
             loss_dict = loss_fns[head_name](
-                predictions[head_name],
-                {
-                    "targets": batch[f"targets_{head_name}"],
-                    "organism_index": batch["organism_index"],
-                },
+                predictions[head_name], _head_batch(batch, head_name)
             )
             head_losses[head_name] = loss_dict["loss"]
         head_losses = jax.tree_util.tree_map(

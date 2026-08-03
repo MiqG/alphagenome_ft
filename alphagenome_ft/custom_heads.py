@@ -157,6 +157,35 @@ _HEAD_REGISTRY: dict[str, HeadFactory] = {}
 _HEAD_CONFIG_REGISTRY: dict[str, HeadConfigLike] = {}
 _HEAD_METADATA_REGISTRY: dict[str, Mapping | None] = {}
 
+# Junction-head instance name -> position-source info (see
+# alphagenome_ft.finetune.config.SpliceSourceSpec.junction_position_source).
+# Populated by alphagenome_ft.finetune.train.register_predefined_heads() for
+# splice_sites_junction heads with junction_position_source="predicted".
+_JUNCTION_POSITION_SOURCE_REGISTRY: dict[str, dict[str, Any]] = {}
+
+
+def register_junction_position_source(
+    head_name: HeadNameLike,
+    *,
+    top_k: int,
+    classification_head_id: str,
+) -> None:
+    """Record that a junction head derives positions from a classification head's logits.
+
+    Only needed for ``junction_position_source="predicted"`` — annotated-mode
+    junction heads don't need this (positions come from the data pipeline).
+    """
+    normalized_name = normalize_head_name(head_name)
+    _JUNCTION_POSITION_SOURCE_REGISTRY[normalized_name] = {
+        "top_k": top_k,
+        "classification_head_id": normalize_head_name(classification_head_id),
+    }
+
+
+def get_junction_position_source(head_name: HeadNameLike) -> dict[str, Any] | None:
+    """Return ``{"top_k", "classification_head_id"}`` for a predicted-mode junction head, else None."""
+    return _JUNCTION_POSITION_SOURCE_REGISTRY.get(normalize_head_name(head_name))
+
 
 # --- Normalization and classification helpers ---
 def _normalize_predefined_head_name(head_name: HeadNameLike) -> PredefinedHeadName | None:

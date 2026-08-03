@@ -3,6 +3,7 @@
 from alphagenome_ft.finetune.config import (
     TrackInfo,
     HeadSpec,
+    SpliceSourceSpec,
     load_targets_config,
     prepare_head_specs,
     validate_head_specs,
@@ -18,6 +19,7 @@ from alphagenome_ft.finetune.data import (
     build_fasta_index,
     prepare_batch,
 )
+from alphagenome_ft.finetune.splice_data import SpliceDataModule
 from alphagenome_ft.finetune.train import (
     register_predefined_heads,
     create_optimizer,
@@ -28,6 +30,7 @@ __all__ = [
     # config
     'TrackInfo',
     'HeadSpec',
+    'SpliceSourceSpec',
     'load_targets_config',
     'prepare_head_specs',
     'validate_head_specs',
@@ -41,6 +44,7 @@ __all__ = [
     'prepare_intervals_from_split',
     'build_fasta_index',
     'prepare_batch',
+    'SpliceDataModule',
     # train
     'register_predefined_heads',
     'create_optimizer',

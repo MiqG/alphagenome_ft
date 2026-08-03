@@ -826,4 +826,15 @@ def prepare_batch(
     }
     for head_name in head_names:
         prepared[f'targets_{head_name}'] = jnp.asarray(batch[f'targets_{head_name}'])
+    if 'splice_site_positions' in batch:
+        prepared['splice_site_positions'] = jnp.asarray(
+            batch['splice_site_positions'], dtype=jnp.int32
+        )
+    # Raw per-window junction events, only present when SpliceDataModule was
+    # built with emit_raw_junction_events=True (junction_position_source="predicted").
+    if 'junction_d_rel' in batch:
+        prepared['junction_d_rel'] = jnp.asarray(batch['junction_d_rel'], dtype=jnp.int32)
+        prepared['junction_a_rel'] = jnp.asarray(batch['junction_a_rel'], dtype=jnp.int32)
+        prepared['junction_is_pos_strand'] = jnp.asarray(batch['junction_is_pos_strand'])
+        prepared['junction_counts'] = jnp.asarray(batch['junction_counts'], dtype=jnp.float32)
     return prepared

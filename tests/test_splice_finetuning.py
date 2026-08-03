@@ -1,0 +1,488 @@
+"""Tests for splice fine-tuning: parsers, config wiring, and head construction.
+
+Covers the three splice modalities (``splice_sites_classification``,
+``splice_sites_usage``, ``splice_sites_junction``) added on top of the
+already-working ``alphagenome_research`` splice heads. Parser/config tests
+run without any pretrained checkpoint; the end-to-end ``train()`` smoke test
+additionally requires Kaggle credentials (see ``tests/kaggle_util.py``) since
+it downloads the real pretrained weights.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import haiku as hk
+import jax
+import jax.numpy as jnp
+import numpy as np
+import pandas as pd
+import pytest
+from alphagenome.data import genome
+
+from alphagenome_ft import custom_heads as custom_heads_module
+from alphagenome_ft.finetune import config as ft_config
+from alphagenome_ft.finetune import star_junctions as sj
+from alphagenome_ft.finetune.splice_data import SpliceDataModule
+from alphagenome_ft.finetune.splice_positions import build_junction_matrix, top_k_splice_positions
+
+from tests.conftest import require_kaggle_credentials
+
+
+SAMPLE1_SJ = "sample1.SJ.out.tab"
+SAMPLE2_SJ = "sample2.SJ.out.tab"
+
+# Two junctions, both on chr1 + strand: (1000, 2000) and (3000, 4000).
+_SJ_ROWS = {
+    SAMPLE1_SJ: [
+        "chr1\t1000\t2000\t1\t1\t1\t10\t0\t20",
+        "chr1\t3000\t4000\t1\t1\t1\t5\t0\t20",
+    ],
+    SAMPLE2_SJ: [
+        "chr1\t1000\t2000\t1\t1\t1\t8\t0\t20",
+        "chr1\t3000\t4000\t1\t1\t1\t3\t0\t20",
+    ],
+}
+
+
+@pytest.fixture()
+def star_junction_files(tmp_path: Path) -> list[str]:
+    paths = []
+    for name, rows in _SJ_ROWS.items():
+        path = tmp_path / name
+        path.write_text("\n".join(rows) + "\n")
+        paths.append(str(path))
+    return paths
+
+
+@pytest.fixture()
+def mock_fasta(tmp_path: Path) -> str:
+    """A tiny single-chromosome FASTA covering the fixture junction coordinates."""
+    import pyfaidx
+
+    seq = "ACGT" * 2000  # 8000bp of chr1, comfortably covers positions up to ~4000.
+    path = tmp_path / "mock_genome.fa"
+    lines = [">chr1"]
+    for i in range(0, len(seq), 70):
+        lines.append(seq[i : i + 70])
+    path.write_text("\n".join(lines) + "\n")
+    pyfaidx.Faidx(str(path))  # builds mock_genome.fa.fai, as FastaExtractor requires
+    return str(path)
+
+
+class TestStarJunctionsParser:
+    def test_read_star_junctions(self, star_junction_files):
+        df = sj.read_star_junctions(star_junction_files[0])
+        assert list(df["chrom"]) == ["chr1", "chr1"]
+        assert list(df["intron_start"]) == [1000, 3000]
+        assert list(df["strand"]) == ["+", "+"]
+        assert list(df["n_uniquely_mapped_reads"]) == [10, 5]
+
+    def test_junctions_to_classification_array(self, star_junction_files):
+        juncs = [sj.read_star_junctions(p) for p in star_junction_files]
+        for j in juncs:
+            j["exon_start"] = j["intron_start"] - 1
+            j["exon_end"] = j["intron_end"] + 1
+            j["count"] = j["n_uniquely_mapped_reads"]
+        arr = sj.junctions_to_classification_array(juncs, "chr1", 0, 5000)
+        assert arr.shape == (5000, 5)
+        # donor at 1-based exon_start=999 -> 0-based relative idx 999-1-0=998, class 0 (Donor+)
+        assert arr[998, 0] == 1.0
+        # background positions default to class 4 (None)
+        assert arr[0, 4] == 1.0
+
+    def test_junctions_to_junction_matrix(self, star_junction_files):
+        juncs = []
+        for p in star_junction_files:
+            j = sj.read_star_junctions(p)
+            j["exon_start"] = j["intron_start"] - 1
+            j["exon_end"] = j["intron_end"] + 1
+            j["count"] = j["n_uniquely_mapped_reads"]
+            juncs.append(j)
+        cls_arr = sj.junctions_to_classification_array(juncs, "chr1", 0, 5000)
+        positions, matrix = sj.junctions_to_junction_matrix(
+            juncs, max_splice_sites=16, cls_arr=cls_arr, chrom="chr1", start=0, seq_len=5000
+        )
+        assert positions.shape == (4, 16)
+        assert matrix.shape == (16, 16, 2 * len(juncs))
+        assert matrix.sum() > 0
+
+
+class TestSpliceDataModule:
+    def test_batches_have_expected_shapes(self, star_junction_files, mock_fasta):
+        windows = [genome.Interval(chromosome="chr1", start=0, end=5000)]
+        module = SpliceDataModule(
+            intervals={"train": windows},
+            fasta_path=mock_fasta,
+            star_junction_files=star_junction_files,
+            head_kinds={
+                "splice_sites": "cls_head",
+                "splice_site_usage": "usage_head",
+                "splice_junctions": "junction_head",
+            },
+            batch_size=1,
+            shuffle=False,
+            filter_to_junctions=False,
+            max_splice_sites=16,
+        )
+        batches = list(module.iter_batches("train"))
+        assert len(batches) == 1
+        batch = batches[0]
+
+        assert batch["sequences"].shape == (1, 5000, 4)
+        assert batch["targets_cls_head"].shape == (1, 5000, 5)
+        assert batch["targets_usage_head"].shape == (1, 5000, 4)  # 2 samples * 2 strands
+        assert batch["usage_alpha_usage_head"].shape == (1, 5000, 4)
+        assert batch["targets_junction_head"].shape == (1, 16, 16, 4)
+        assert batch["splice_site_positions"].shape == (1, 4, 16)
+        assert batch["splice_site_positions"].dtype == np.int32
+
+    def test_rejects_unknown_kind(self, star_junction_files, mock_fasta):
+        with pytest.raises(ValueError, match="Unknown splice kind"):
+            SpliceDataModule(
+                intervals={"train": []},
+                fasta_path=mock_fasta,
+                star_junction_files=star_junction_files,
+                head_kinds={"not_a_kind": "head"},
+                batch_size=1,
+                shuffle=False,
+            )
+
+
+class TestSpliceHeadSpecs:
+    """Config wiring: prepare_head_specs / validate_head_specs / head construction."""
+
+    def _cfg(self, star_junction_files, kind):
+        return {
+            "heads": [
+                {
+                    "id": f"my_{kind}",
+                    "source": "predefined",
+                    "kind": kind,
+                    "star_junctions": star_junction_files,
+                }
+            ]
+        }
+
+    @pytest.mark.parametrize(
+        "kind,expected_num_tracks",
+        [
+            ("splice_sites_classification", 5),
+            ("splice_sites_usage", 4),
+            ("splice_sites_junction", 4),
+        ],
+    )
+    def test_prepare_and_construct_head(
+        self, star_junction_files, kind, expected_num_tracks
+    ):
+        specs = ft_config.prepare_head_specs(
+            self._cfg(star_junction_files, kind), organism="HOMO_SAPIENS"
+        )
+        ft_config.validate_head_specs(specs)
+        assert len(specs) == 1
+        spec = specs[0]
+        assert spec.kind == kind
+        assert spec.splice_source is not None
+
+        def fwd():
+            head = custom_heads_module.create_predefined_head_from_config(
+                spec.config, metadata=spec.metadata
+            )
+            return head.num_tracks
+
+        transformed = hk.transform(fwd)
+        params = transformed.init(jax.random.PRNGKey(0))
+        num_tracks = transformed.apply(params, None)
+        assert int(num_tracks) == expected_num_tracks
+
+    def test_missing_star_junctions_raises(self):
+        cfg = {
+            "heads": [
+                {"id": "bad", "source": "predefined", "kind": "splice_sites_classification"}
+            ]
+        }
+        with pytest.raises(ValueError, match="star_junctions"):
+            ft_config.prepare_head_specs(cfg, organism="HOMO_SAPIENS")
+
+
+class TestPredictedJunctionPositionConfig:
+    """Config validation for junction_position_source="predicted"."""
+
+    def _junction_entry(self, star_junction_files, **overrides):
+        entry = {
+            "id": "junc_head",
+            "source": "predefined",
+            "kind": "splice_sites_junction",
+            "star_junctions": star_junction_files,
+            "junction_position_source": "predicted",
+        }
+        entry.update(overrides)
+        return entry
+
+    def test_missing_classification_head_id_raises(self, star_junction_files):
+        cfg = {"heads": [self._junction_entry(star_junction_files)]}
+        with pytest.raises(ValueError, match="classification_head_id"):
+            ft_config.prepare_head_specs(cfg, organism="HOMO_SAPIENS")
+
+    def test_unresolved_classification_head_raises(self, star_junction_files):
+        cfg = {
+            "heads": [
+                self._junction_entry(star_junction_files, classification_head_id="missing_cls")
+            ]
+        }
+        with pytest.raises(ValueError, match="no \"splice_sites_classification\" head"):
+            ft_config.prepare_head_specs(cfg, organism="HOMO_SAPIENS")
+
+    def test_valid_predicted_config_accepted(self, star_junction_files):
+        cfg = {
+            "heads": [
+                {
+                    "id": "cls_head",
+                    "source": "predefined",
+                    "kind": "splice_sites_classification",
+                    "star_junctions": star_junction_files,
+                },
+                self._junction_entry(star_junction_files, classification_head_id="cls_head"),
+            ]
+        }
+        specs = ft_config.prepare_head_specs(cfg, organism="HOMO_SAPIENS")
+        ft_config.validate_head_specs(specs)
+        junction_spec = next(s for s in specs if s.head_id == "junc_head")
+        assert junction_spec.splice_source.junction_position_source == "predicted"
+        assert junction_spec.splice_source.classification_head_id == "cls_head"
+
+
+class TestTopKSplicePositions:
+    def test_selects_top_k_per_role_and_sorts_ascending(self):
+        logits = jnp.zeros((1, 10, 5))
+        # donor+ channel: peaks at positions 1 (score 5) and 3 (score 3)
+        logits = logits.at[0, :, 0].set(jnp.array([0, 5, 0, 3, 0, 0, 0, 0, 0, 0]))
+        positions = top_k_splice_positions(logits, top_k=2)
+        assert positions.shape == (1, 4, 2)
+        assert positions.dtype == jnp.int32
+        np.testing.assert_array_equal(np.asarray(positions[0, 0]), [1, 3])
+
+    def test_pads_with_minus_one_when_top_k_exceeds_seq_len(self):
+        logits = jnp.zeros((1, 4, 5))
+        positions = top_k_splice_positions(logits, top_k=6)
+        assert positions.shape == (1, 4, 6)
+        np.testing.assert_array_equal(np.asarray(positions[0, 0]), [0, 1, 2, 3, -1, -1])
+
+
+class TestBuildJunctionMatrix:
+    """Cross-check the vectorized JAX rebuild against the trusted pandas reference."""
+
+    def test_matches_pandas_reference(self):
+        rows1 = pd.DataFrame({
+            "chrom": ["chr1", "chr1", "chr1"],
+            "exon_start": [100, 300, 300],
+            "exon_end": [200, 400, 4500],
+            "strand": ["+", "+", "-"],
+            "count": [10.0, 5.0, 7.0],
+        })
+        rows2 = pd.DataFrame({
+            "chrom": ["chr1", "chr1"],
+            "exon_start": [100, 300],
+            "exon_end": [200, 400],
+            "strand": ["+", "-"],
+            "count": [3.0, 2.0],
+        })
+        all_juncs = [rows1, rows2]
+
+        cls_arr = np.zeros((5000, 5), dtype=np.float32)
+        cls_arr[:, 4] = 1.0
+
+        def set_class(idx, c):
+            cls_arr[idx, 4] = 0.0
+            cls_arr[idx, c] = 1.0
+
+        set_class(99, 0)
+        set_class(299, 0)
+        set_class(199, 1)
+        set_class(399, 1)
+        set_class(299, 2)
+        set_class(4499, 3)
+
+        max_splice_sites = 8
+        positions_np, matrix_np = sj.junctions_to_junction_matrix(
+            all_juncs, max_splice_sites=max_splice_sites, cls_arr=cls_arr,
+            chrom="chr1", start=0, seq_len=5000,
+        )
+
+        n_samples = len(all_juncs)
+        rows = []
+        for sample_idx, df in enumerate(all_juncs):
+            for _, r in df.iterrows():
+                counts = [0.0] * n_samples
+                counts[sample_idx] = float(r["count"])
+                rows.append(
+                    (int(r["exon_start"]) - 1, int(r["exon_end"]) - 1, r["strand"] == "+", counts)
+                )
+        max_junctions = 8
+        d_rel = np.full((1, max_junctions), -1, dtype=np.int32)
+        a_rel = np.full((1, max_junctions), -1, dtype=np.int32)
+        is_pos = np.zeros((1, max_junctions), dtype=bool)
+        counts_arr = np.zeros((1, max_junctions, n_samples), dtype=np.float32)
+        for i, (d, a, pos_strand, c) in enumerate(rows):
+            d_rel[0, i] = d
+            a_rel[0, i] = a
+            is_pos[0, i] = pos_strand
+            counts_arr[0, i, :] = c
+
+        matrix_jax = build_junction_matrix(
+            jnp.asarray(positions_np[None]),
+            jnp.asarray(d_rel), jnp.asarray(a_rel), jnp.asarray(is_pos), jnp.asarray(counts_arr),
+            max_splice_sites=max_splice_sites,
+        )
+        np.testing.assert_allclose(np.asarray(matrix_jax)[0], matrix_np)
+
+
+@pytest.mark.finetuning
+class TestSpliceTrainingSmoke:
+    """End-to-end smoke test: real pretrained checkpoint + one train() step."""
+
+    def test_one_train_step_all_splice_heads(
+        self, tmp_path, star_junction_files, mock_fasta, device
+    ):
+        require_kaggle_credentials()
+        from alphagenome_ft import create_model_with_heads, register_predefined_head
+        from alphagenome_ft.finetune import train as ft_train
+        from alphagenome.data import genome as genome_lib
+
+        head_kinds = {
+            "splice_sites": "cls_head",
+            "splice_site_usage": "usage_head",
+            "splice_junctions": "junction_head",
+        }
+        cfg = {
+            "heads": [
+                {
+                    "id": "cls_head",
+                    "source": "predefined",
+                    "kind": "splice_sites_classification",
+                    "star_junctions": star_junction_files,
+                },
+                {
+                    "id": "usage_head",
+                    "source": "predefined",
+                    "kind": "splice_sites_usage",
+                    "star_junctions": star_junction_files,
+                },
+                {
+                    "id": "junction_head",
+                    "source": "predefined",
+                    "kind": "splice_sites_junction",
+                    "star_junctions": star_junction_files,
+                    "max_splice_sites": 16,
+                },
+            ]
+        }
+        specs = ft_config.prepare_head_specs(cfg, organism="HOMO_SAPIENS")
+        ft_config.validate_head_specs(specs)
+        ft_train.register_predefined_heads(specs)
+
+        model = create_model_with_heads(
+            "all_folds",
+            heads=[s.head_id for s in specs],
+            device=device,
+            use_encoder_output=True,
+            init_seq_len=5000,
+        )
+
+        windows = [genome_lib.Interval(chromosome="chr1", start=0, end=5000)]
+        data_module = SpliceDataModule(
+            intervals={"train": windows, "valid": windows},
+            fasta_path=mock_fasta,
+            star_junction_files=star_junction_files,
+            head_kinds=head_kinds,
+            batch_size=1,
+            shuffle=False,
+            filter_to_junctions=False,
+            max_splice_sites=16,
+        )
+
+        ft_train.train(
+            model,
+            data_module,
+            specs,
+            learning_rate=1e-4,
+            weight_decay=0.0,
+            num_epochs=1,
+            max_train_steps=1,
+            heads_only=True,
+            organism="HOMO_SAPIENS",
+        )
+
+    @pytest.mark.parametrize("heads_only", [True, False])
+    def test_one_train_step_predicted_junction_positions(
+        self, star_junction_files, mock_fasta, device, heads_only,
+    ):
+        """Predicted mode must be correct with and without a frozen backbone —
+        that's the whole point of rebuilding the target matrix as a pure JAX
+        op instead of a host/pandas round-trip (see splice_positions.py)."""
+        require_kaggle_credentials()
+        from alphagenome_ft import create_model_with_heads
+        from alphagenome_ft.finetune import train as ft_train
+        from alphagenome.data import genome as genome_lib
+
+        head_kinds = {
+            "splice_sites": "cls_head",
+            "splice_junctions": "junction_head",
+        }
+        cfg = {
+            "heads": [
+                {
+                    "id": "cls_head",
+                    "source": "predefined",
+                    "kind": "splice_sites_classification",
+                    "star_junctions": star_junction_files,
+                },
+                {
+                    "id": "junction_head",
+                    "source": "predefined",
+                    "kind": "splice_sites_junction",
+                    "star_junctions": star_junction_files,
+                    "max_splice_sites": 16,
+                    "junction_position_source": "predicted",
+                    "junction_top_k": 16,
+                    "classification_head_id": "cls_head",
+                },
+            ]
+        }
+        specs = ft_config.prepare_head_specs(cfg, organism="HOMO_SAPIENS")
+        ft_config.validate_head_specs(specs)
+        ft_train.register_predefined_heads(specs)
+
+        model = create_model_with_heads(
+            "all_folds",
+            heads=[s.head_id for s in specs],
+            device=device,
+            use_encoder_output=True,
+            init_seq_len=5000,
+        )
+
+        windows = [genome_lib.Interval(chromosome="chr1", start=0, end=5000)]
+        data_module = SpliceDataModule(
+            intervals={"train": windows, "valid": windows},
+            fasta_path=mock_fasta,
+            star_junction_files=star_junction_files,
+            head_kinds=head_kinds,
+            batch_size=1,
+            shuffle=False,
+            filter_to_junctions=False,
+            max_splice_sites=16,
+            emit_raw_junction_events=True,
+            max_junctions_per_window=32,
+        )
+
+        ft_train.train(
+            model,
+            data_module,
+            specs,
+            learning_rate=1e-4,
+            weight_decay=0.0,
+            num_epochs=1,
+            max_train_steps=1,
+            heads_only=heads_only,
+            organism="HOMO_SAPIENS",
+        )

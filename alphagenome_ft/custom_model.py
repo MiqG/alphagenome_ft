@@ -2279,6 +2279,7 @@ def create_model_with_heads(
     checkpoint_path: str | os.PathLike[str] | None = None,
     use_encoder_output: bool = False,
     detach_backbone: bool = False,
+    gradient_checkpointing: bool = False,
     include_standard_heads: bool = False,
     init_seq_len: int = 2**14,
 ) -> CustomAlphaGenomeModel:
@@ -2303,6 +2304,19 @@ def create_model_with_heads(
             before transformer. This enables heads to access raw CNN features.
         detach_backbone: If True, stop gradients at the backbone embeddings so
             heads-only training avoids backprop through the backbone.
+        gradient_checkpointing: If True, wrap the backbone forward pass
+            (encoder+transformer+decoder) in ``jax.checkpoint`` so its
+            activations are recomputed during the backward pass instead of
+            all being retained, trading compute for memory. JAX/Haiku analogue
+            of alphagenome-pytorch's ``--gradient-checkpointing``
+            (``torch.utils.checkpoint`` wrapping the encoder/tower/decoder).
+            Only matters when the backward pass actually reaches the backbone
+            (i.e. ``detach_backbone=False``, as needed for e.g. real backbone
+            LoRA) - with ``detach_backbone=True`` (heads-only probing) no
+            backward pass ever touches the backbone, so this is a no-op
+            exactly as it is for alphagenome-pytorch's own frozen-backbone
+            path (torch.no_grad() there means torch.utils.checkpoint has
+            nothing to recompute either).
         include_standard_heads: If True, compute the standard pretrained heads
             in addition to the requested heads. If False, skip standard heads
             to save compute/memory.
@@ -2410,7 +2424,11 @@ def create_model_with_heads(
                         num_organisms = len(metadata)
 
                         # Step 1: Run encoder ONLY
-                        trunk, intermediates = model_lib.SequenceEncoder()(dna_sequence, is_training=False)
+                        encoder = model_lib.SequenceEncoder()
+                        call_encoder = lambda seq: encoder(seq, is_training=False)
+                        if gradient_checkpointing:
+                            call_encoder = jax.checkpoint(call_encoder)
+                        trunk, intermediates = call_encoder(dna_sequence)
                         encoder_output = trunk  # Save encoder output
 
                         # Create extended embeddings with ONLY encoder output
@@ -2443,9 +2461,16 @@ def create_model_with_heads(
             # but we only use the embeddings, not the standard head predictions
             alphagenome = model_lib.AlphaGenome(metadata)
 
-            # Get embeddings from the backbone (without running standard heads)
-            # We only need the embeddings, not the standard predictions
-            _, embeddings = alphagenome(dna_sequence, organism_index)
+            # Call forward_trunk directly (not __call__) - we only need
+            # embeddings, never the standard pretrained heads' predictions,
+            # so this also skips computing (and, when gradient_checkpointing
+            # is on, needlessly recomputing) those on every step.
+            # forward_trunk is @hk.name_like('__call__'), so parameter paths
+            # still match a checkpoint saved via the real __call__.
+            if gradient_checkpointing:
+                embeddings = jax.checkpoint(alphagenome.forward_trunk)(dna_sequence, organism_index)
+            else:
+                embeddings = alphagenome.forward_trunk(dna_sequence, organism_index)
             if detach_backbone:
                 embeddings = _stop_gradient_embeddings(embeddings)
 
@@ -2546,6 +2571,7 @@ def create_model_with_custom_heads(
     device: jax.Device | None = None,
     use_encoder_output: bool = False,
     detach_backbone: bool = False,
+    gradient_checkpointing: bool = False,
     include_standard_heads: bool = False,
     init_seq_len: int = 2**20,
     checkpoint_path: str | os.PathLike[str] | None = None,
@@ -2558,6 +2584,7 @@ def create_model_with_custom_heads(
         device=device,
         use_encoder_output=use_encoder_output,
         detach_backbone=detach_backbone,
+        gradient_checkpointing=gradient_checkpointing,
         include_standard_heads=include_standard_heads,
         init_seq_len=init_seq_len,
         checkpoint_path=checkpoint_path,
@@ -2759,6 +2786,7 @@ def load_checkpoint(
     base_checkpoint_path: str | os.PathLike[str] | None = None,
     init_seq_len: int | None = None,
     detach_backbone: bool = False,
+    gradient_checkpointing: bool = False,
 ) -> CustomAlphaGenomeModel:
     """Load a saved head checkpoint.
 
@@ -2951,6 +2979,7 @@ def load_checkpoint(
         checkpoint_path=base_checkpoint_path,
         use_encoder_output=template_use_encoder,
         detach_backbone=detach_backbone,
+        gradient_checkpointing=gradient_checkpointing,
         init_seq_len=init_for_template,
     )
     restore_target = template_model._checkpoint_slice_trees(

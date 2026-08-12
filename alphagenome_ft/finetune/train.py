@@ -174,6 +174,7 @@ def train(
     wandb_run_name: str | None = None,
     wandb_config: dict | None = None,
     num_devices: int = 1,
+    gradient_accumulation_steps: int = 1,
 ) -> None:
     """Run fine-tuning with pmapped train/eval steps.
 
@@ -200,6 +201,14 @@ def train(
         wandb_run_name: Optional W&B run-name override.
         wandb_config: Optional extra config keys to merge into W&B config.
         num_devices: Number of local devices to use. Defaults to single-device.
+        gradient_accumulation_steps: Number of data-module batches to average
+            gradients over before applying one optimizer update. Effective
+            batch size per optimizer step is
+            ``data_module._batch_size * gradient_accumulation_steps``. Defaults
+            to 1 (one optimizer step per batch, matching the original
+            behavior). Trailing batches in an epoch that don't complete a full
+            accumulation window are dropped, same as ``drop_last`` for
+            multi-device sharding.
 
     Notes:
         Total planned steps are computed before training from train-set size and
@@ -222,13 +231,28 @@ def train(
     if num_train_examples == 0:
         raise ValueError("No train intervals available for training.")
 
+    if gradient_accumulation_steps < 1:
+        raise ValueError(
+            f"gradient_accumulation_steps must be at least 1, got {gradient_accumulation_steps}."
+        )
+
     if data_module._drop_last:
-        steps_per_epoch = num_train_examples // data_module._batch_size
+        micro_steps_per_epoch = num_train_examples // data_module._batch_size
     else:
-        steps_per_epoch = math.ceil(num_train_examples / data_module._batch_size)
-    if steps_per_epoch == 0:
+        micro_steps_per_epoch = math.ceil(num_train_examples / data_module._batch_size)
+    if micro_steps_per_epoch == 0:
         raise ValueError(
             "Computed zero training steps per epoch. Check batch size, drop_last, and train intervals."
+        )
+    # Optimizer steps per epoch, after accumulating gradient_accumulation_steps
+    # batches per update. Trailing micro-batches that don't fill a full
+    # accumulation window are dropped (see docstring).
+    steps_per_epoch = micro_steps_per_epoch // gradient_accumulation_steps
+    if steps_per_epoch == 0:
+        raise ValueError(
+            f"gradient_accumulation_steps={gradient_accumulation_steps} exceeds "
+            f"micro_steps_per_epoch={micro_steps_per_epoch}; no optimizer step would "
+            "ever run. Reduce gradient_accumulation_steps or increase train data."
         )
 
     planned_steps = steps_per_epoch * num_epochs
@@ -327,7 +351,15 @@ def train(
         return head_batch
 
     @functools.partial(jax.pmap, axis_name="data")
-    def train_step(params, state, current_opt_state, batch):
+    def grad_step(params, state, batch):
+        """Compute (loss, grads) for one micro-batch, without applying them.
+
+        Split out from the optimizer update so gradient_accumulation_steps > 1
+        can average grads over several micro-batches before one
+        optimizer.update call — alphagenome_ft's train() previously took one
+        full optimizer step per data_module batch with no accumulation.
+        """
+
         def loss_fn(current_params):
             predictions = model._predict(
                 current_params,
@@ -349,9 +381,14 @@ def train(
         loss_value, grads = jax.value_and_grad(loss_fn)(params)
         loss_value = jax.lax.pmean(loss_value, axis_name="data")
         grads = jax.lax.pmean(grads, axis_name="data")
+        return loss_value, grads
+
+    @functools.partial(jax.pmap, axis_name="data")
+    def apply_grads(params, current_opt_state, grads):
+        """Apply one optimizer update from (possibly accumulated) grads."""
         updates, new_opt_state = optimizer.update(grads, current_opt_state, params)
         new_params = optax.apply_updates(params, updates)
-        return new_params, new_opt_state, loss_value
+        return new_params, new_opt_state
 
     @functools.partial(jax.pmap, axis_name="data")
     def eval_step(params, state, batch):
@@ -433,25 +470,46 @@ def train(
 
             epoch_step = 0
             train_losses: list[float] = []
+            accum_grads = None
+            accum_loss_sum = 0.0
+            accum_count = 0
             for batch_np in data_module.iter_batches("train", seed=seed + epoch):
                 batch = prepare_batch(batch_np, organism_index_value, head_names)
                 batch = _shard_batch(batch, num_devices)
                 batch["strand_reindexing"] = strand_reindexing_replicated
-                replicated_params, opt_state, loss_value = train_step(
-                    replicated_params,
-                    replicated_state,
-                    opt_state,
-                    batch,
+                micro_loss_value, micro_grads = grad_step(
+                    replicated_params, replicated_state, batch,
                 )
-                loss_scalar = float(np.asarray(loss_value)[0])
+                accum_grads = (
+                    micro_grads
+                    if accum_grads is None
+                    else jax.tree_util.tree_map(jnp.add, accum_grads, micro_grads)
+                )
+                accum_loss_sum += float(np.asarray(micro_loss_value)[0])
+                accum_count += 1
+
+                if accum_count < gradient_accumulation_steps:
+                    continue
+
+                # Full accumulation window reached: average grads over the
+                # window and take exactly one optimizer step.
+                averaged_grads = jax.tree_util.tree_map(
+                    lambda g: g / gradient_accumulation_steps, accum_grads,
+                )
+                replicated_params, opt_state = apply_grads(
+                    replicated_params, opt_state, averaged_grads,
+                )
+                loss_scalar = accum_loss_sum / accum_count
+                accum_grads = None
+                accum_loss_sum = 0.0
+                accum_count = 0
+
                 train_losses.append(loss_scalar)
                 epoch_step += 1
                 global_step += 1
 
                 if verbose:
                     print(
-                        # f"  step {global_step:0{step_width}d}/{total_train_steps:0{step_width}d}"
-                        # f" | epoch_step {epoch_step:04d} | loss {loss_scalar:.4f}",
                         f"  step {epoch_step:0{step_width}d}/{steps_per_epoch:0{step_width}d}"
                         f" | loss {loss_scalar:.4f}",
                         end="\r",
@@ -464,7 +522,6 @@ def train(
                             "train/step_loss": loss_scalar,
                             "epoch": epoch,
                             "step": global_step,
-                            # "epoch_step": epoch_step,
                         }
                     )
 

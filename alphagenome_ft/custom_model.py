@@ -2758,6 +2758,7 @@ def load_checkpoint(
     device: jax.Device | None = None,
     base_checkpoint_path: str | os.PathLike[str] | None = None,
     init_seq_len: int | None = None,
+    detach_backbone: bool = False,
 ) -> CustomAlphaGenomeModel:
     """Load a saved head checkpoint.
 
@@ -2768,6 +2769,14 @@ def load_checkpoint(
         checkpoint_dir: Directory containing the checkpoint files.
         base_model_version: Base model version to use (only needed for heads-only checkpoints).
         organism_settings: Optional organism settings.
+        detach_backbone: If True, stop gradients at the backbone embeddings in
+            the reconstructed model's forward pass, matching whatever value
+            was used for the original `create_model_with_heads` call this
+            checkpoint came from. This only affects the rebuilt template
+            model's forward function, not the restored parameter values
+            themselves, but MUST match the original training call or a
+            heads-only-frozen run resumed without it will silently backprop
+            through (and need memory for) the full backbone again.
         device: Optional JAX device.
 
         base_checkpoint_path: Optional local checkpoint directory for the base
@@ -2941,6 +2950,7 @@ def load_checkpoint(
         device=device,
         checkpoint_path=base_checkpoint_path,
         use_encoder_output=template_use_encoder,
+        detach_backbone=detach_backbone,
         init_seq_len=init_for_template,
     )
     restore_target = template_model._checkpoint_slice_trees(

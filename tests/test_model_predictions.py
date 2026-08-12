@@ -219,7 +219,7 @@ class TestPredictionConsistency:
                                         num_organisms = len(metadata)
                                         
                                         # Step 1: Encoder (scoped as alphagenome/sequence_encoder/...)
-                                        trunk, intermediates = model_lib.SequenceEncoder()(dna_sequence)
+                                        trunk, intermediates = model_lib.SequenceEncoder()(dna_sequence, is_training=False)
                                         encoder_output = trunk  # Save before organism embedding
                                         
                                         # Step 2: Add organism embedding (scoped as alphagenome/embed/...)
@@ -229,17 +229,17 @@ class TestPredictionConsistency:
                                         trunk += organism_embedding_trunk[:, None, :]
                                         
                                         # Step 3: Transformer (scoped as alphagenome/transformer_tower/...)
-                                        trunk, pair_activations = model_lib.TransformerTower()(trunk)
+                                        trunk, pair_activations = model_lib.TransformerTower()(trunk, is_training=False)
                                         
                                         # Step 4: Decoder (scoped as alphagenome/sequence_decoder/...)
-                                        x = model_lib.SequenceDecoder()(trunk, intermediates)
+                                        x = model_lib.SequenceDecoder()(trunk, intermediates, is_training=False)
                                         
                                         # Step 5: Output embeddings (scoped as alphagenome/output_embedder_.../...)
                                         embeddings_128bp = embeddings_module.OutputEmbedder(num_organisms)(
-                                            trunk, organism_index
+                                            trunk, organism_index, is_training=False
                                         )
                                         embeddings_1bp = embeddings_module.OutputEmbedder(num_organisms)(
-                                            x, organism_index, embeddings_128bp
+                                            x, organism_index, is_training=False, skip_x=embeddings_128bp
                                         )
                                         # Note: embeddings_pair is not included in ExtendedEmbeddings
                                         

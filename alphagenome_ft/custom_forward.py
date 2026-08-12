@@ -61,7 +61,7 @@ def forward_with_encoder_output(
     num_organisms = alphagenome._num_organisms
     
     # Step 1: Run encoder - exactly as AlphaGenome does
-    trunk, intermediates = model_lib.SequenceEncoder()(dna_sequence)
+    trunk, intermediates = model_lib.SequenceEncoder()(dna_sequence, is_training=False)
     
     # Save encoder output (before organism embedding and transformer)
     encoder_output = trunk
@@ -73,17 +73,17 @@ def forward_with_encoder_output(
     trunk += organism_embedding_trunk[:, None, :]
     
     # Step 2: Run transformer
-    trunk, pair_activations = model_lib.TransformerTower()(trunk)
+    trunk, pair_activations = model_lib.TransformerTower()(trunk, is_training=False)
     
     # Step 3: Run decoder
-    x = model_lib.SequenceDecoder()(trunk, intermediates)
+    x = model_lib.SequenceDecoder()(trunk, intermediates, is_training=False)
     
     # Step 4: Create output embeddings (same as AlphaGenome)
     embeddings_128bp = embeddings_module.OutputEmbedder(num_organisms)(
-        trunk, organism_index
+        trunk, organism_index, is_training=False
     )
     embeddings_1bp = embeddings_module.OutputEmbedder(num_organisms)(
-        x, organism_index, embeddings_128bp
+        x, organism_index, is_training=False, skip_x=embeddings_128bp
     )
     
     # Step 5: Return extended embeddings with encoder output

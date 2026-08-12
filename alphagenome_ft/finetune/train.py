@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import functools
+import json
 import math
 from pathlib import Path
 from typing import Mapping, Sequence
@@ -175,6 +176,7 @@ def train(
     wandb_config: dict | None = None,
     num_devices: int = 1,
     gradient_accumulation_steps: int = 1,
+    resume_from: Path | None = None,
 ) -> None:
     """Run fine-tuning with pmapped train/eval steps.
 
@@ -209,6 +211,16 @@ def train(
             behavior). Trailing batches in an epoch that don't complete a full
             accumulation window are dropped, same as ``drop_last`` for
             multi-device sharding.
+        resume_from: Optional checkpoint directory (as saved by this function,
+            e.g. ``checkpoint_dir / "last"``) to resume epoch/step bookkeeping
+            from via its ``train_state.json`` sidecar. Only affects the epoch
+            loop bounds, global_step count, and best-metric tracking — the
+            model weights to resume from must be loaded into ``model`` by the
+            caller *before* calling ``train()`` (e.g. via
+            ``alphagenome_ft.load_checkpoint``), since ``train()`` always
+            starts from whatever ``model._params``/``model._state`` currently
+            are. Optimizer state (Adam moments) is NOT restored and always
+            reinitializes from zero on resume — a known, accepted approximation.
 
     Notes:
         Total planned steps are computed before training from train-set size and
@@ -445,14 +457,48 @@ def train(
     best_value: float | None = None
     epochs_since_improvement = 0
     global_step = 0
+    start_epoch = 1
+
+    if resume_from is not None:
+        state_path = Path(resume_from) / "train_state.json"
+        if state_path.exists():
+            saved = json.loads(state_path.read_text())
+            start_epoch = saved["epoch"] + 1
+            global_step = saved["global_step"]
+            best_value = saved.get("best_value")
+            epochs_since_improvement = saved.get("epochs_since_improvement", 0)
+            print(
+                f"Resuming from {state_path}: model weights are assumed already "
+                f"loaded by the caller; continuing bookkeeping at epoch "
+                f"{start_epoch}, global_step {global_step} (optimizer state is "
+                f"NOT resumed and reinitializes from zero)."
+            )
+        else:
+            print(
+                f"--resume_from={resume_from} given but no train_state.json found "
+                f"there; starting epoch/step bookkeeping from scratch (any model "
+                f"weights already loaded by the caller are still used)."
+            )
 
     print(
         "Train plan: "
         f"{num_train_examples} examples | "
         f"{steps_per_epoch} step(s)/epoch | "
         f"{num_epochs} epoch(s) | "
-        f"total step(s) {total_train_steps}"
+        f"total step(s) {total_train_steps} | "
+        f"starting at epoch {start_epoch}, global_step {global_step}"
     )
+
+    def _write_train_state(target_dir: Path, epoch: int) -> None:
+        (target_dir / "train_state.json").write_text(json.dumps({
+            "epoch": epoch,
+            "global_step": global_step,
+            "best_value": best_value,
+            "epochs_since_improvement": epochs_since_improvement,
+        }))
+
+    if start_epoch > num_epochs:
+        print(f"Already completed {start_epoch - 1}/{num_epochs} requested epochs; nothing to do.")
 
     with model._device_context:
         replicated_params = _replicate_tree(model._params, devices)
@@ -460,7 +506,7 @@ def train(
         opt_state = _replicate_tree(opt_state, devices)
         strand_reindexing_replicated = _replicate_tree(strand_reindexing, devices)
         stop_training = False
-        for epoch in range(1, num_epochs + 1):
+        for epoch in range(start_epoch, num_epochs + 1):
             if verbose:
                 print(f"\n{'=' * 60}")
                 print(f"Epoch {epoch}/{num_epochs}")
@@ -576,6 +622,7 @@ def train(
                             " -- saving best checkpoint"
                         )
                         model.save_checkpoint(checkpoint_dir / "best", save_full_model=False)
+                        _write_train_state(checkpoint_dir / "best", epoch)
                 else:
                     epochs_since_improvement += 1
             else:
@@ -585,6 +632,7 @@ def train(
                 model._params = _unreplicate_tree(replicated_params)
                 model._state = _unreplicate_tree(replicated_state)
                 model.save_checkpoint(checkpoint_dir / "last", save_full_model=False)
+                _write_train_state(checkpoint_dir / "last", epoch)
 
             if early_stopping_patience > 0 and epochs_since_improvement >= early_stopping_patience:
                 print(f"\n  Early stopping: no improvement for {epochs_since_improvement} epoch(s)")
@@ -598,6 +646,7 @@ def train(
 
     if checkpoint_dir and not (checkpoint_dir / "last").exists():
         model.save_checkpoint(checkpoint_dir / "last", save_full_model=False)
+        _write_train_state(checkpoint_dir / "last", start_epoch - 1)
 
     print(f"\n{'=' * 60}")
     print("Training complete!")

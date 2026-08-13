@@ -449,8 +449,9 @@ def train(
             epochs_since_improvement = saved.get("epochs_since_improvement", 0)
             opt_state_path = Path(resume_from) / "opt_state"
             if opt_state_path.exists():
+                # orbax's tensorstore backend requires an absolute path.
                 opt_state = ocp.StandardCheckpointer().restore(
-                    str(opt_state_path), target=opt_state,
+                    str(opt_state_path.resolve()), target=opt_state,
                 )
                 opt_state_msg = f"optimizer state restored from {opt_state_path}"
             else:
@@ -496,7 +497,11 @@ def train(
             import shutil
             shutil.rmtree(checkpoint_path)
         checkpointer = ocp.StandardCheckpointer()
-        checkpointer.save(str(checkpoint_path), _unreplicate_tree(opt_state))
+        # Save with the same absolute-path convention as the restore above
+        # (orbax's tensorstore backend requires it there; matching it here
+        # too, rather than relying on save's laxer/inconsistent handling of
+        # relative paths, keeps both sides unambiguous).
+        checkpointer.save(str(checkpoint_path.resolve()), _unreplicate_tree(opt_state))
         checkpointer.wait_until_finished()
 
     if start_epoch > num_epochs:

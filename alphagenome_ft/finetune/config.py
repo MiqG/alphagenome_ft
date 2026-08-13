@@ -295,10 +295,31 @@ def _build_track_metadata(
 ) -> Mapping[dna_client.Organism, AlphaGenomeOutputMetadata]:
     """Build an AlphaGenomeOutputMetadata mapping from user-provided tracks.
 
-    ``nonzero_mean`` values stored on each track are kept for use by the data
-    pipeline but are not required for the metadata object itself.
+    Includes a ``nonzero_mean`` column (defaulting missing per-track values to
+    1.0, i.e. no scaling) whenever any track provides one. This matters: the
+    real predefined head classes (``alphagenome_research.model.heads``, e.g.
+    ``BaseResolutionHead.__init__``'s ``_get_track_means``) read
+    ``metadata['nonzero_mean']`` directly to rescale predictions/targets on
+    every forward pass (``predictions_scaling``/``unscale``/``loss``) -
+    without this column they silently fall back to all-ones (no scaling).
+    Confirmed by reading alphagenome_research/model/heads.py directly, not
+    assumed from the column merely existing in the dataframe schema.
     """
-    return _metadata_from_names([track.name for track in tracks], organism, output_type)
+    names = [track.name for track in tracks]
+    df = pd.DataFrame({
+        "name": names,
+        "strand": ["+"] * len(names),
+    })
+    if any(track.nonzero_mean is not None for track in tracks):
+        df["nonzero_mean"] = [
+            track.nonzero_mean if track.nonzero_mean is not None else 1.0
+            for track in tracks
+        ]
+    field_name = output_type.name.lower()
+    ag_metadata = AlphaGenomeOutputMetadata(**{field_name: df})
+    if organism is not None:
+        return {organism: ag_metadata}
+    return {org: ag_metadata for org in dna_client.Organism}
 
 
 # Fixed 5-class label order matching the classification target built by

@@ -17,7 +17,6 @@ import orbax.checkpoint as ocp
 from alphagenome.models import dna_model as ag_dna_model
 from alphagenome_research.model import dna_model as research_dna_model
 
-from alphagenome_ft import parameter_utils
 from alphagenome_ft.custom_model import CustomAlphaGenomeModel
 from alphagenome_ft.finetune.config import HeadSpec
 from alphagenome_ft.finetune.data import BigWigDataModule, prepare_batch
@@ -53,68 +52,12 @@ def register_predefined_heads(head_specs: Sequence[HeadSpec]) -> None:
             )
 
 
-def _keypath_to_str(path_tuple: tuple) -> str:
-    """Convert a JAX parameter key-path tuple to a slash-delimited string."""
-    parts = []
-    for key in path_tuple:
-        if isinstance(key, parameter_utils.DictKey):
-            parts.append(str(key.key))
-        elif isinstance(key, parameter_utils.GetAttrKey):
-            parts.append(str(key.name))
-        elif isinstance(key, parameter_utils.SequenceKey):
-            parts.append(str(key.idx))
-        else:
-            parts.append(str(key))
-    return "/".join(parts)
-
-
-def _is_trainable_head_path(path_str: str, trainable_heads: set[str]) -> bool:
-    """Return True if a parameter path belongs to any requested trainable head."""
-    for head_name in trainable_heads:
-        if f"/head/{head_name}/" in path_str or path_str.startswith(f"head/{head_name}/"):
-            return True
-    return False
-
-
-def _label_params_for_heads(params, trainable_heads: Sequence[str]):
-    """Label model parameters as trainable head params vs frozen params."""
-    head_set = {str(name) for name in trainable_heads}
-
-    def label_fn(path, _value):
-        path_str = _keypath_to_str(path)
-        return "head" if _is_trainable_head_path(path_str, head_set) else "frozen"
-
-    return jax.tree_util.tree_map_with_path(label_fn, params)
-
-
-def create_optimizer(
-    params,
-    trainable_head_names: Sequence[str],
-    learning_rate: float,
-    weight_decay: float,
-    heads_only: bool,
-):
-    """Create optimizer for full finetuning or heads-only finetuning."""
-    if heads_only:
-        head_set = {str(name) for name in trainable_head_names}
-        head_paths = parameter_utils.get_head_parameter_paths(params)
-        matched_paths = [path for path in head_paths if _is_trainable_head_path(path, head_set)]
-        if not matched_paths:
-            sample_paths = ", ".join(head_paths[:5]) if head_paths else "<none>"
-            raise ValueError(
-                "No trainable head parameters matched --heads-only filter. "
-                f"Names tried: {sorted(head_set)}. "
-                f"Head parameter sample: {sample_paths}"
-            )
-        param_labels = _label_params_for_heads(params, trainable_head_names)
-        return optax.multi_transform(
-            {
-                "head": optax.adamw(learning_rate, weight_decay=weight_decay),
-                "frozen": optax.set_to_zero(),
-            },
-            param_labels,
-        )
-    return optax.adamw(learning_rate, weight_decay=weight_decay)
+## create_optimizer used to be redefined locally here (heads_only masking via
+## optax.multi_transform, no gradient clipping) - a duplicate of, and shadowed
+## the import of, alphagenome_ft.optimizer_utils.create_optimizer below, which
+## already does the same heads_only masking AND supports
+## gradient_clip_global_norm. Removed the local duplicate so the import is
+## what actually runs, and threaded gradient_clip_global_norm through train().
 
 
 def _replicate_tree(tree, devices):
@@ -179,6 +122,7 @@ def train(
     gradient_accumulation_steps: int = 1,
     resume_from: Path | None = None,
     save_every_steps: int | None = None,
+    gradient_clip_global_norm: float | None = None,
 ) -> None:
     """Run fine-tuning with pmapped train/eval steps.
 
@@ -246,6 +190,11 @@ def train(
             reported average train loss (which only reflects steps *after*
             the resume point when resuming mid-epoch — a minor, accepted
             approximation).
+        gradient_clip_global_norm: If set, clip gradients to this global norm
+            before the optimizer update (``optax.clip_by_global_norm``, via
+            ``alphagenome_ft.optimizer_utils.create_optimizer`` — see that
+            function's docstring). Matches alphagenome-pytorch's
+            ``--max-grad-norm``. ``None`` (default) disables clipping.
 
     Notes:
         Total planned steps are computed before training from train-set size and
@@ -354,6 +303,7 @@ def train(
         learning_rate=learning_rate,
         weight_decay=weight_decay,
         heads_only=heads_only,
+        gradient_clip_global_norm=gradient_clip_global_norm,
     )
     opt_state = optimizer.init(model._params)
 

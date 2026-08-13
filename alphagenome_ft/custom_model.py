@@ -2427,7 +2427,13 @@ def create_model_with_heads(
                         encoder = model_lib.SequenceEncoder()
                         call_encoder = lambda seq: encoder(seq, is_training=False)
                         if gradient_checkpointing:
-                            call_encoder = jax.checkpoint(call_encoder)
+                            # hk.remat, not jax.checkpoint: this call is inside
+                            # a Haiku transform, and jax.checkpoint's re-trace
+                            # leaks a tracer out of Haiku's implicit RNG-key
+                            # threading (a Python-side mutable PRNGSequence),
+                            # raising UnexpectedTracerError. hk.remat is the
+                            # Haiku-aware equivalent.
+                            call_encoder = hk.remat(call_encoder)
                         trunk, intermediates = call_encoder(dna_sequence)
                         encoder_output = trunk  # Save encoder output
 
@@ -2468,7 +2474,10 @@ def create_model_with_heads(
             # forward_trunk is @hk.name_like('__call__'), so parameter paths
             # still match a checkpoint saved via the real __call__.
             if gradient_checkpointing:
-                embeddings = jax.checkpoint(alphagenome.forward_trunk)(dna_sequence, organism_index)
+                # hk.remat, not jax.checkpoint (see the encoder-only branch
+                # above for why): plain jax.checkpoint on a Haiku-bound call
+                # leaks a tracer from Haiku's implicit RNG threading.
+                embeddings = hk.remat(alphagenome.forward_trunk)(dna_sequence, organism_index)
             else:
                 embeddings = alphagenome.forward_trunk(dna_sequence, organism_index)
             if detach_backbone:

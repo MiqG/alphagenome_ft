@@ -13,6 +13,7 @@ import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 import numpy as np
 import optax
+import orbax.checkpoint as ocp
 from alphagenome.models import dna_model as ag_dna_model
 from alphagenome_research.model import dna_model as research_dna_model
 
@@ -212,15 +213,17 @@ def train(
             accumulation window are dropped, same as ``drop_last`` for
             multi-device sharding.
         resume_from: Optional checkpoint directory (as saved by this function,
-            e.g. ``checkpoint_dir / "last"``) to resume epoch/step bookkeeping
-            from via its ``train_state.json`` sidecar. Only affects the epoch
-            loop bounds, global_step count, and best-metric tracking — the
-            model weights to resume from must be loaded into ``model`` by the
-            caller *before* calling ``train()`` (e.g. via
-            ``alphagenome_ft.load_checkpoint``), since ``train()`` always
-            starts from whatever ``model._params``/``model._state`` currently
-            are. Optimizer state (Adam moments) is NOT restored and always
-            reinitializes from zero on resume — a known, accepted approximation.
+            e.g. ``checkpoint_dir / "last"``) to resume epoch/step bookkeeping,
+            and optimizer (Adam) state if an ``opt_state`` sidecar is present
+            there, from. Model weights/state to resume from must still be
+            loaded into ``model`` by the caller *before* calling ``train()``
+            (e.g. via ``alphagenome_ft.load_checkpoint``), since ``train()``
+            always starts from whatever ``model._params``/``model._state``
+            currently are — only the optimizer state and epoch/step
+            bookkeeping are handled here. If ``train_state.json`` exists but
+            ``opt_state`` doesn't (e.g. a checkpoint saved before this
+            parameter existed), optimizer state reinitializes from zero and a
+            warning is printed rather than failing.
 
     Notes:
         Total planned steps are computed before training from train-set size and
@@ -467,11 +470,21 @@ def train(
             global_step = saved["global_step"]
             best_value = saved.get("best_value")
             epochs_since_improvement = saved.get("epochs_since_improvement", 0)
+            opt_state_path = Path(resume_from) / "opt_state"
+            if opt_state_path.exists():
+                opt_state = ocp.StandardCheckpointer().restore(
+                    str(opt_state_path), target=opt_state,
+                )
+                opt_state_msg = f"optimizer state restored from {opt_state_path}"
+            else:
+                opt_state_msg = (
+                    f"no opt_state found at {opt_state_path}; optimizer state "
+                    f"reinitializes from zero"
+                )
             print(
                 f"Resuming from {state_path}: model weights are assumed already "
                 f"loaded by the caller; continuing bookkeeping at epoch "
-                f"{start_epoch}, global_step {global_step} (optimizer state is "
-                f"NOT resumed and reinitializes from zero)."
+                f"{start_epoch}, global_step {global_step} ({opt_state_msg})."
             )
         else:
             print(
@@ -496,6 +509,15 @@ def train(
             "best_value": best_value,
             "epochs_since_improvement": epochs_since_improvement,
         }))
+
+    def _save_opt_state(target_dir: Path) -> None:
+        checkpoint_path = target_dir / "opt_state"
+        if checkpoint_path.exists():
+            import shutil
+            shutil.rmtree(checkpoint_path)
+        checkpointer = ocp.StandardCheckpointer()
+        checkpointer.save(str(checkpoint_path), _unreplicate_tree(opt_state))
+        checkpointer.wait_until_finished()
 
     if start_epoch > num_epochs:
         print(f"Already completed {start_epoch - 1}/{num_epochs} requested epochs; nothing to do.")
@@ -623,6 +645,7 @@ def train(
                         )
                         model.save_checkpoint(checkpoint_dir / "best", save_full_model=False)
                         _write_train_state(checkpoint_dir / "best", epoch)
+                        _save_opt_state(checkpoint_dir / "best")
                 else:
                     epochs_since_improvement += 1
             else:
@@ -633,6 +656,7 @@ def train(
                 model._state = _unreplicate_tree(replicated_state)
                 model.save_checkpoint(checkpoint_dir / "last", save_full_model=False)
                 _write_train_state(checkpoint_dir / "last", epoch)
+                _save_opt_state(checkpoint_dir / "last")
 
             if early_stopping_patience > 0 and epochs_since_improvement >= early_stopping_patience:
                 print(f"\n  Early stopping: no improvement for {epochs_since_improvement} epoch(s)")
@@ -647,6 +671,7 @@ def train(
     if checkpoint_dir and not (checkpoint_dir / "last").exists():
         model.save_checkpoint(checkpoint_dir / "last", save_full_model=False)
         _write_train_state(checkpoint_dir / "last", start_epoch - 1)
+        _save_opt_state(checkpoint_dir / "last")
 
     print(f"\n{'=' * 60}")
     print("Training complete!")

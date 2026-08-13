@@ -178,6 +178,7 @@ def train(
     num_devices: int = 1,
     gradient_accumulation_steps: int = 1,
     resume_from: Path | None = None,
+    save_every_steps: int | None = None,
 ) -> None:
     """Run fine-tuning with pmapped train/eval steps.
 
@@ -224,6 +225,27 @@ def train(
             ``opt_state`` doesn't (e.g. a checkpoint saved before this
             parameter existed), optimizer state reinitializes from zero and a
             warning is printed rather than failing.
+        save_every_steps: If set, also save a "last" checkpoint every this
+            many optimizer steps, in addition to the always-on end-of-epoch
+            "last" save — mirrors alphagenome-pytorch's ``--save-every-steps``
+            (used there for exactly the same reason: without it, a run killed
+            mid-epoch on a wall-time-limited partition loses the *entire*
+            epoch's progress, not just progress since the last checkpoint,
+            since the previous checkpoint is the *prior* epoch's end).
+            ``resume_from`` correctly resumes mid-epoch from one of these:
+            the train_state.json sidecar records not just the last completed
+            epoch but how many optimizer steps into the *current* epoch were
+            done, and the data-batch iterator is fast-forwarded (batches
+            skipped without computing gradients, not replayed) to the same
+            position before real training resumes — safe because
+            ``iter_batches``' shuffle is a deterministic function of
+            ``(len(windows), seed)`` (see both data modules' ``iter_batches``
+            directly), so the same ``seed + epoch`` always reproduces the
+            same batch order. Does not affect ``best`` (which is inherently
+            tied to a completed epoch's validation pass) or the epoch's
+            reported average train loss (which only reflects steps *after*
+            the resume point when resuming mid-epoch — a minor, accepted
+            approximation).
 
     Notes:
         Total planned steps are computed before training from train-set size and
@@ -461,12 +483,17 @@ def train(
     epochs_since_improvement = 0
     global_step = 0
     start_epoch = 1
+    # How many optimizer steps of start_epoch are already done (mid-epoch
+    # resume via save_every_steps). 0 for a fresh start or an epoch-boundary
+    # resume; only ever nonzero for the FIRST epoch iterated after resuming.
+    start_epoch_step = 0
 
     if resume_from is not None:
         state_path = Path(resume_from) / "train_state.json"
         if state_path.exists():
             saved = json.loads(state_path.read_text())
-            start_epoch = saved["epoch"] + 1
+            start_epoch = saved["resume_epoch"]
+            start_epoch_step = saved.get("resume_epoch_step", 0)
             global_step = saved["global_step"]
             best_value = saved.get("best_value")
             epochs_since_improvement = saved.get("epochs_since_improvement", 0)
@@ -484,7 +511,8 @@ def train(
             print(
                 f"Resuming from {state_path}: model weights are assumed already "
                 f"loaded by the caller; continuing bookkeeping at epoch "
-                f"{start_epoch}, global_step {global_step} ({opt_state_msg})."
+                f"{start_epoch} step {start_epoch_step}, global_step "
+                f"{global_step} ({opt_state_msg})."
             )
         else:
             print(
@@ -499,12 +527,14 @@ def train(
         f"{steps_per_epoch} step(s)/epoch | "
         f"{num_epochs} epoch(s) | "
         f"total step(s) {total_train_steps} | "
-        f"starting at epoch {start_epoch}, global_step {global_step}"
+        f"starting at epoch {start_epoch} step {start_epoch_step}, "
+        f"global_step {global_step}"
     )
 
-    def _write_train_state(target_dir: Path, epoch: int) -> None:
+    def _write_train_state(target_dir: Path, resume_epoch: int, resume_epoch_step: int = 0) -> None:
         (target_dir / "train_state.json").write_text(json.dumps({
-            "epoch": epoch,
+            "resume_epoch": resume_epoch,
+            "resume_epoch_step": resume_epoch_step,
             "global_step": global_step,
             "best_value": best_value,
             "epochs_since_improvement": epochs_since_improvement,
@@ -520,7 +550,7 @@ def train(
         checkpointer.wait_until_finished()
 
     if start_epoch > num_epochs:
-        print(f"Already completed {start_epoch - 1}/{num_epochs} requested epochs; nothing to do.")
+        print(f"Already completed {num_epochs}/{num_epochs} requested epochs; nothing to do.")
 
     with model._device_context:
         replicated_params = _replicate_tree(model._params, devices)
@@ -536,12 +566,23 @@ def train(
             else:
                 print(f"Epoch {epoch}/{num_epochs}")
 
-            epoch_step = 0
+            epoch_step = start_epoch_step if epoch == start_epoch else 0
+            # Fast-forward past already-completed micro-batches when resuming
+            # mid-epoch (save_every_steps) — see train()'s docstring for why
+            # this is safe: iter_batches' shuffle depends only on
+            # (len(windows), seed), so seed + epoch reproduces the identical
+            # batch order every time, and skip_remaining is always an exact
+            # multiple of gradient_accumulation_steps (an accumulation-window
+            # boundary), so no special-casing of accum_grads is needed below.
+            skip_remaining = epoch_step * gradient_accumulation_steps if epoch == start_epoch else 0
             train_losses: list[float] = []
             accum_grads = None
             accum_loss_sum = 0.0
             accum_count = 0
             for batch_np in data_module.iter_batches("train", seed=seed + epoch):
+                if skip_remaining > 0:
+                    skip_remaining -= 1
+                    continue
                 batch = prepare_batch(batch_np, organism_index_value, head_names)
                 batch = _shard_batch(batch, num_devices)
                 batch["strand_reindexing"] = strand_reindexing_replicated
@@ -592,6 +633,15 @@ def train(
                             "step": global_step,
                         }
                     )
+
+                if checkpoint_dir and save_every_steps and global_step % save_every_steps == 0:
+                    model._params = _unreplicate_tree(replicated_params)
+                    model._state = _unreplicate_tree(replicated_state)
+                    model.save_checkpoint(checkpoint_dir / "last", save_full_model=False)
+                    _write_train_state(checkpoint_dir / "last", resume_epoch=epoch, resume_epoch_step=epoch_step)
+                    _save_opt_state(checkpoint_dir / "last")
+                    if verbose:
+                        print(f"\n  Mid-epoch checkpoint saved (step {epoch_step}/{steps_per_epoch})")
 
                 if global_step >= total_train_steps:
                     stop_training = True
@@ -644,7 +694,7 @@ def train(
                             " -- saving best checkpoint"
                         )
                         model.save_checkpoint(checkpoint_dir / "best", save_full_model=False)
-                        _write_train_state(checkpoint_dir / "best", epoch)
+                        _write_train_state(checkpoint_dir / "best", resume_epoch=epoch + 1, resume_epoch_step=0)
                         _save_opt_state(checkpoint_dir / "best")
                 else:
                     epochs_since_improvement += 1
@@ -655,7 +705,7 @@ def train(
                 model._params = _unreplicate_tree(replicated_params)
                 model._state = _unreplicate_tree(replicated_state)
                 model.save_checkpoint(checkpoint_dir / "last", save_full_model=False)
-                _write_train_state(checkpoint_dir / "last", epoch)
+                _write_train_state(checkpoint_dir / "last", resume_epoch=epoch + 1, resume_epoch_step=0)
                 _save_opt_state(checkpoint_dir / "last")
 
             if early_stopping_patience > 0 and epochs_since_improvement >= early_stopping_patience:
@@ -670,7 +720,9 @@ def train(
 
     if checkpoint_dir and not (checkpoint_dir / "last").exists():
         model.save_checkpoint(checkpoint_dir / "last", save_full_model=False)
-        _write_train_state(checkpoint_dir / "last", start_epoch - 1)
+        _write_train_state(
+            checkpoint_dir / "last", resume_epoch=start_epoch, resume_epoch_step=start_epoch_step,
+        )
         _save_opt_state(checkpoint_dir / "last")
 
     print(f"\n{'=' * 60}")

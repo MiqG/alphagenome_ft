@@ -613,7 +613,14 @@ def train(
             valid_metrics: Mapping[str, float] | None = None
             if "valid" in data_module._intervals and len(data_module._intervals["valid"]) > 0:
                 losses = {head: [] for head in head_names}
-                for batch_np in data_module.iter_batches("valid"):
+                # Explicit seed, not the default (None): CombinedDataModule
+                # passes this same seed to both its underlying modules, so an
+                # explicit shared value is what keeps their independent
+                # shuffles in lock-step (see the "train" call above). Passing
+                # none here would let each module draw its own OS-entropy
+                # seed via np.random.default_rng(None), desynchronizing them
+                # even though both received the same "None" argument.
+                for batch_np in data_module.iter_batches("valid", seed=seed):
                     batch = prepare_batch(batch_np, organism_index_value, head_names)
                     batch = _shard_batch(batch, num_devices)
                     batch["strand_reindexing"] = strand_reindexing_replicated

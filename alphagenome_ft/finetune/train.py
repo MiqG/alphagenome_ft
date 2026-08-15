@@ -526,18 +526,23 @@ def train(
             # mid-epoch (save_every_steps) — see train()'s docstring for why
             # this is safe: iter_batches' shuffle depends only on
             # (len(windows), seed), so seed + epoch reproduces the identical
-            # batch order every time, and skip_remaining is always an exact
+            # batch order every time, and skip_batches is always an exact
             # multiple of gradient_accumulation_steps (an accumulation-window
             # boundary), so no special-casing of accum_grads is needed below.
-            skip_remaining = epoch_step * gradient_accumulation_steps if epoch == start_epoch else 0
+            # Passed into iter_batches itself (rather than iterated-and-
+            # discarded here) so it skips via a slice of the deterministic
+            # shuffle order instead of actually extracting (decoding FASTA +
+            # bigwig lookups for) every already-completed batch — the latter
+            # made resuming late in a long epoch cost almost as much wall
+            # time as redoing the training itself.
+            skip_batches = epoch_step * gradient_accumulation_steps if epoch == start_epoch else 0
             train_losses: list[float] = []
             accum_grads = None
             accum_loss_sum = 0.0
             accum_count = 0
-            for batch_np in data_module.iter_batches("train", seed=seed + epoch):
-                if skip_remaining > 0:
-                    skip_remaining -= 1
-                    continue
+            for batch_np in data_module.iter_batches(
+                "train", seed=seed + epoch, skip_batches=skip_batches,
+            ):
                 batch = prepare_batch(batch_np, organism_index_value, head_names)
                 batch = _shard_batch(batch, num_devices)
                 batch["strand_reindexing"] = strand_reindexing_replicated

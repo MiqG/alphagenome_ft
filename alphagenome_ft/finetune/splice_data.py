@@ -193,7 +193,7 @@ class SpliceDataModule:
         return 2 * n
 
     def iter_batches(
-        self, split: str, *, seed: int | None = None
+        self, split: str, *, seed: int | None = None, skip_batches: int = 0
     ) -> Iterator[dict[str, np.ndarray]]:
         windows = list(self._intervals.get(split, ()))
         if not windows:
@@ -203,6 +203,14 @@ class SpliceDataModule:
         if self._shuffle:
             rng = np.random.default_rng(seed)
             rng.shuffle(order)
+        if skip_batches:
+            # Resuming mid-epoch: the shuffle above is a deterministic
+            # function of (len(windows), seed), so slicing off the already
+            # -consumed batches here reproduces the exact same batch order a
+            # full re-iteration would skip past — without paying to extract
+            # (decode FASTA + bigwig lookups for) any of the discarded
+            # windows.
+            order = order[skip_batches * self._batch_size:]
 
         extractor = fasta_lib.FastaExtractor(str(self._fasta_path))
 

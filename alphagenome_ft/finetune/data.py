@@ -681,7 +681,7 @@ class BigWigDataModule:
         return filtered
 
     def iter_batches(
-        self, split: str, *, seed: int | None = None
+        self, split: str, *, seed: int | None = None, skip_batches: int = 0
     ) -> Iterator[dict[str, np.ndarray]]:
         windows = list(self._intervals.get(split, ()))
         if not windows:
@@ -691,6 +691,12 @@ class BigWigDataModule:
         if self._shuffle:
             rng = np.random.default_rng(seed)
             rng.shuffle(order)
+        if skip_batches:
+            # See SpliceDataModule.iter_batches's matching comment: slicing
+            # the deterministic shuffle order skips already-consumed batches
+            # without extracting (FASTA decode + bigwig lookups for) any of
+            # them.
+            order = order[skip_batches * self._batch_size:]
 
         extractor = fasta_lib.FastaExtractor(str(self._fasta_path))
         with contextlib.ExitStack() as stack:

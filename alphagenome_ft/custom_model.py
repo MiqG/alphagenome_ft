@@ -630,8 +630,20 @@ class CustomAlphaGenomeModel:
             """Compute loss within transform."""
             predictions, batch = predictions_and_batch
             entry = self._head_configs[head_name]
+            # Native alphagenome_research heads (e.g. SpliceSitesJunctionHead)
+            # deliberately return an *unweighted* internal loss — their
+            # HeadConfig.loss_weight (e.g. 0.2 for splice junctions, see
+            # alphagenome_research.model.heads.get_head_config) is meant to
+            # be applied by the training loop when summing across heads.
+            # Without this, splice_junctions trains 5x over-weighted relative
+            # to every other head (1.0 * 0.2 -> 0.2, 0.2 * 0.2 -> 0.04 for
+            # its CE/Poisson terms — exactly matching alphagenome-pytorch's
+            # hardcoded 0.2/0.04 in _compute_junction_strand_loss, which
+            # pre-multiplies this same constant into its own loss function).
+            head_loss_weight = 1.0
             if entry.source == 'predefined':
                 head_config = entry.config
+                head_loss_weight = getattr(head_config, 'loss_weight', 1.0)
                 head_metadata = _resolve_user_metadata(
                     head_name=head_name,
                     head_config=head_config,
@@ -755,7 +767,10 @@ class CustomAlphaGenomeModel:
                     metadata=None,  # Use head's config metadata, not organism metadata
                     num_organisms=len(self._metadata)
                 )
-            return head.loss(predictions, batch)
+            loss_dict = head.loss(predictions, batch)
+            if head_loss_weight != 1.0:
+                loss_dict = {**loss_dict, 'loss': loss_dict['loss'] * head_loss_weight}
+            return loss_dict
 
         # Transform without apply_rng since we don't need randomness
         transformed = hk.without_apply_rng(hk.transform(

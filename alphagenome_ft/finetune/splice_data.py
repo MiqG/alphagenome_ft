@@ -146,6 +146,16 @@ class SpliceDataModule:
             junc = normalize_junctions_per_sample(junc)
             self._all_juncs.append(junc)
 
+        # Per-chrom slices of self._all_juncs, used by the per-window hot path
+        # (_window_targets/_raw_junction_events) so those calls filter a
+        # ~1/24th-size chrom slice instead of re-scanning the full per-sample
+        # table (hundreds of thousands of rows) on every single window.
+        self._all_juncs_by_chrom: list[dict[str, pd.DataFrame]] = [
+            {chrom: group for chrom, group in junc.groupby("chrom", sort=False)}
+            for junc in self._all_juncs
+        ]
+        self._empty_juncs = [junc.iloc[0:0] for junc in self._all_juncs]
+
         self._gtf_sites: pd.DataFrame | None = None
         self._gtf_juncs: pd.DataFrame | None = None
         if gtf_file is not None:
@@ -224,6 +234,18 @@ class SpliceDataModule:
         if batch_indices and not self._drop_last:
             yield self._make_batch(batch_indices, windows, extractor)
 
+    def _juncs_for_chrom(self, chrom: str) -> list[pd.DataFrame]:
+        """Per-sample junction DataFrames restricted to one chromosome.
+
+        Precomputed once in __init__ via groupby; looking this up per window
+        avoids re-scanning the full (hundreds-of-thousands-row) per-sample
+        table with a fresh boolean mask on every call.
+        """
+        return [
+            by_chrom.get(chrom, empty)
+            for by_chrom, empty in zip(self._all_juncs_by_chrom, self._empty_juncs)
+        ]
+
     def _raw_junction_events(
         self, chrom: str, start: int, seq_len: int
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
@@ -245,10 +267,9 @@ class SpliceDataModule:
 
         end = start + seq_len
         row = 0
-        for sample_idx, junc_df in enumerate(self._all_juncs):
+        for sample_idx, junc_df in enumerate(self._juncs_for_chrom(chrom)):
             mask = (
-                (junc_df["chrom"] == chrom)
-                & (junc_df["exon_start"] > start)
+                (junc_df["exon_start"] > start)
                 & (junc_df["exon_start"] <= end)
                 & (junc_df["exon_end"] > start)
                 & (junc_df["exon_end"] <= end)
@@ -296,11 +317,12 @@ class SpliceDataModule:
                 usage_tracks.extend([pos_arr, neg_arr])
                 alpha_tracks.extend([pos_alpha, neg_alpha])
         else:
-            cls_juncs = self._all_juncs + ([self._gtf_juncs] if self._gtf_juncs is not None else [])
+            chrom_juncs = self._juncs_for_chrom(chrom)
+            cls_juncs = chrom_juncs + ([self._gtf_juncs] if self._gtf_juncs is not None else [])
             cls_arr = junctions_to_classification_array(cls_juncs, chrom, start, seq_len)
 
             usage_tracks, alpha_tracks = [], []
-            for junc_df in self._all_juncs:
+            for junc_df in chrom_juncs:
                 pos_arr, neg_arr = junctions_to_ssu_approx_arrays_by_strand(
                     junc_df, chrom, start, seq_len
                 )
@@ -312,7 +334,7 @@ class SpliceDataModule:
         usage_alpha_arr = np.stack(alpha_tracks, axis=-1)
 
         junc_positions, junc_matrix = junctions_to_junction_matrix(
-            self._all_juncs,
+            self._juncs_for_chrom(chrom),
             max_splice_sites=self._max_splice_sites,
             cls_arr=cls_arr,
             chrom=chrom,

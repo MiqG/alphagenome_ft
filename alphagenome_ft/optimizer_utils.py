@@ -30,13 +30,31 @@ def is_trainable_head_path(path_str: str, trainable_heads: set[str]) -> bool:
     return False
 
 
-def label_params_for_trainable_heads(params: PyTree, trainable_head_names: Sequence[str]) -> PyTree:
-    """Label each leaf ``\"head\"`` (train) vs ``\"frozen\"`` for :func:`optax.multi_transform`."""
+def label_params_for_trainable_heads(
+    params: PyTree,
+    trainable_head_names: Sequence[str],
+    *,
+    lora_enabled: bool = False,
+) -> PyTree:
+    """Label each leaf ``\"head\"`` (train) vs ``\"frozen\"`` for :func:`optax.multi_transform`.
+
+    When ``lora_enabled`` is True, backbone LoRA adapter leaves (any path whose
+    final segment is ``lora_a``/``lora_b``, see ``alphagenome_ft.lora.
+    get_lora_parameter_paths``) are also labeled ``"head"`` (trained), matching
+    alphagenome-pytorch's ``--mode lora`` trainable set: LoRA adapters + heads,
+    everything else frozen.
+    """
     head_set = {str(n) for n in trainable_head_names}
+    lora_paths: set[str] = set()
+    if lora_enabled:
+        from alphagenome_ft.lora import get_lora_parameter_paths
+        lora_paths = set(get_lora_parameter_paths(params))
 
     def label_fn(path, _value):
         ps = parameter_path_to_str(path)
-        return "head" if is_trainable_head_path(ps, head_set) else "frozen"
+        if is_trainable_head_path(ps, head_set) or ps in lora_paths:
+            return "head"
+        return "frozen"
 
     return jax.tree_util.tree_map_with_path(label_fn, params)
 
@@ -83,6 +101,7 @@ def create_optimizer(
     learning_rate: Any,
     weight_decay: float | None = None,
     heads_only: bool = False,
+    lora_enabled: bool = False,
     optimizer_type: str = "adamw",
     gradient_clip_global_norm: float | None = None,
 ) -> optax.GradientTransformation:
@@ -100,6 +119,10 @@ def create_optimizer(
         weight_decay: Optional L2 / AdamW decay. ``None`` uses Optax defaults (no extra decay
             for AdamW beyond its default).
         heads_only: If True, apply ``optax.multi_transform`` head vs frozen masking.
+        lora_enabled: If True (only meaningful with ``heads_only=True``), also
+            keep backbone LoRA adapter params (``lora_a``/``lora_b`` leaves)
+            trainable alongside the heads — matches alphagenome-pytorch's
+            ``--mode lora`` trainable set.
         optimizer_type: ``\"adamw\"`` or ``\"adam\"``.
         gradient_clip_global_norm: If set, prepend ``optax.clip_by_global_norm``.
 
@@ -114,7 +137,9 @@ def create_optimizer(
 
     if heads_only:
         assert_trainable_head_params_exist(params, trainable_head_names)
-        labels = label_params_for_trainable_heads(params, trainable_head_names)
+        labels = label_params_for_trainable_heads(
+            params, trainable_head_names, lora_enabled=lora_enabled,
+        )
         inner = optax.multi_transform(
             {"head": inner, "frozen": optax.set_to_zero()},
             labels,

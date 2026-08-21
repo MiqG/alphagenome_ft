@@ -5,8 +5,10 @@ from __future__ import annotations
 import functools
 import json
 import math
+import queue
+import threading
 from pathlib import Path
-from typing import Mapping, Sequence
+from typing import Iterator, Mapping, Sequence
 
 import jax
 import jax.numpy as jnp
@@ -21,7 +23,42 @@ from alphagenome_ft.custom_model import CustomAlphaGenomeModel
 from alphagenome_ft.finetune.config import HeadSpec
 from alphagenome_ft.finetune.data import BigWigDataModule, prepare_batch
 from alphagenome_ft.finetune.splice_data import SpliceDataModule
-from alphagenome_ft.optimizer_utils import create_optimizer
+from alphagenome_ft.optimizer_utils import create_optimizer, label_params_for_trainable_heads
+
+
+def _prefetch(iterator: Iterator, buffer_size: int = 2) -> Iterator:
+    """Run ``iterator`` on a background thread, buffering up to
+    ``buffer_size`` items ahead of the consumer.
+
+    The training loop's per-microbatch data loading (FASTA decode + bigwig/
+    parquet lookups, all CPU-bound) previously ran fully serialized with the
+    GPU compute for the *previous* microbatch: the generator only produces
+    the next batch once the consumer asks for it, and JAX's async dispatch
+    means the GPU sits idle while that happens. Loading the next batch on a
+    separate thread while the main thread's `grad_step` call keeps the GPU
+    busy overlaps the two instead.
+    """
+    q: queue.Queue = queue.Queue(maxsize=buffer_size)
+    _SENTINEL = object()
+
+    def _worker() -> None:
+        try:
+            for item in iterator:
+                q.put(item)
+        except BaseException as exc:  # noqa: BLE001 - re-raised on consumer side
+            q.put(exc)
+            return
+        q.put(_SENTINEL)
+
+    thread = threading.Thread(target=_worker, daemon=True)
+    thread.start()
+    while True:
+        item = q.get()
+        if item is _SENTINEL:
+            break
+        if isinstance(item, BaseException):
+            raise item
+        yield item
 
 
 def register_predefined_heads(head_specs: Sequence[HeadSpec]) -> None:
@@ -106,6 +143,7 @@ def train(
     seed: int = 42,
     max_train_steps: int | None = None,
     heads_only: bool = False,
+    lora_enabled: bool = False,
     checkpoint_dir: Path | None = None,
     organism: str = "HOMO_SAPIENS",
     best_metric: str = "valid_loss",
@@ -136,6 +174,13 @@ def train(
         seed: Base RNG seed used for per-epoch training shuffles.
         max_train_steps: Optional global cap on optimizer updates across all epochs.
         heads_only: If True, freeze backbone and optimize selected heads only.
+        lora_enabled: If True (requires ``heads_only=True``), also keep
+            backbone LoRA adapter params trainable alongside the heads —
+            matches alphagenome-pytorch's ``--mode lora``. The caller is
+            responsible for having installed the LoRA-patched backbone (see
+            ``alphagenome_ft.lora.install_mha_backbone_lora``) and for NOT
+            passing ``detach_backbone=True`` to model construction (LoRA
+            needs gradients to reach the adapters through the backbone).
         checkpoint_dir: Optional output directory for ``best``/``last`` checkpoints.
         organism: Organism enum name used for model organism indexing.
         best_metric: Metric name used for best-checkpoint and early-stopping tracking.
@@ -294,6 +339,8 @@ def train(
             "Single-host multi-GPU training currently requires drop_last=True so every "
             "batch can be sharded evenly across devices."
         )
+    if lora_enabled and not heads_only:
+        raise ValueError("lora_enabled requires heads_only=True.")
     if heads_only:
         model.freeze_backbone()
 
@@ -303,6 +350,7 @@ def train(
         learning_rate=learning_rate,
         weight_decay=weight_decay,
         heads_only=heads_only,
+        lora_enabled=lora_enabled,
         gradient_clip_global_norm=gradient_clip_global_norm,
     )
     opt_state = optimizer.init(model._params)
@@ -337,6 +385,27 @@ def train(
                 head_batch[key] = batch[key]
         return head_batch
 
+    # Which leaves jax.grad should actually bother computing a real gradient
+    # for. Without this, jax.value_and_grad(loss_fn)(params) below
+    # differentiates w.r.t. the WHOLE ~450M-parameter tree every micro-batch
+    # -- including the frozen backbone -- and create_optimizer's heads_only
+    # masking only discards those gradients *after* the (expensive) backward
+    # pass already computed them. --mode linear-probe avoids this for free
+    # via detach_backbone (a single stop_gradient on the backbone's output
+    # embeddings cuts every path back to every backbone weight at once), but
+    # --mode lora can't use that trick (gradients must reach the LoRA
+    # adapters through the backbone) -- so apply stop_gradient per-weight
+    # instead: frozen leaves get zero gradient AND skip the real backward
+    # computation for that leaf (mirrors PyTorch's requires_grad=False, which
+    # has the same compute-skipping effect, not just a training-update
+    # mask). Confirmed necessary empirically: --mode lora still OOM'd after
+    # switching to per-layer remat alone.
+    _trainable_labels = None
+    if heads_only:
+        _trainable_labels = label_params_for_trainable_heads(
+            model._params, head_names, lora_enabled=lora_enabled,
+        )
+
     @functools.partial(jax.pmap, axis_name="data")
     def grad_step(params, state, batch):
         """Compute (loss, grads) for one micro-batch, without applying them.
@@ -348,6 +417,11 @@ def train(
         """
 
         def loss_fn(current_params):
+            if _trainable_labels is not None:
+                current_params = jax.tree_util.tree_map(
+                    lambda label, x: x if label == "head" else jax.lax.stop_gradient(x),
+                    _trainable_labels, current_params,
+                )
             predictions = model._predict(
                 current_params,
                 state,
@@ -540,9 +614,9 @@ def train(
             accum_grads = None
             accum_loss_sum = 0.0
             accum_count = 0
-            for batch_np in data_module.iter_batches(
+            for batch_np in _prefetch(data_module.iter_batches(
                 "train", seed=seed + epoch, skip_batches=skip_batches,
-            ):
+            )):
                 batch = prepare_batch(batch_np, organism_index_value, head_names)
                 batch = _shard_batch(batch, num_devices)
                 batch["strand_reindexing"] = strand_reindexing_replicated
@@ -625,7 +699,7 @@ def train(
                 # none here would let each module draw its own OS-entropy
                 # seed via np.random.default_rng(None), desynchronizing them
                 # even though both received the same "None" argument.
-                for batch_np in data_module.iter_batches("valid", seed=seed):
+                for batch_np in _prefetch(data_module.iter_batches("valid", seed=seed)):
                     batch = prepare_batch(batch_np, organism_index_value, head_names)
                     batch = _shard_batch(batch, num_devices)
                     batch["strand_reindexing"] = strand_reindexing_replicated

@@ -38,7 +38,7 @@ import enum
 import json
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import haiku as hk
 import jax
@@ -2297,6 +2297,7 @@ def create_model_with_heads(
     gradient_checkpointing: bool = False,
     include_standard_heads: bool = False,
     init_seq_len: int = 2**14,
+    install_backbone_patches: Callable[[], None] | None = None,
 ) -> CustomAlphaGenomeModel:
     """Create an AlphaGenome model with specified heads replacing standard heads.
 
@@ -2335,6 +2336,18 @@ def create_model_with_heads(
         include_standard_heads: If True, compute the standard pretrained heads
             in addition to the requested heads. If False, skip standard heads
             to save compute/memory.
+        install_backbone_patches: Optional zero-arg callback run right after
+            the base pretrained model is loaded/restored, but before this
+            function builds/initializes the custom-heads forward function.
+            Use this to monkeypatch backbone modules (e.g.
+            ``alphagenome_ft.lora.install_mha_backbone_lora``) so the patch is
+            NOT yet active during ``dna_model.create``'s own internal orbax
+            restore (which requires its restore target to structurally match
+            the saved checkpoint exactly — an active patch that adds new
+            parameters, e.g. LoRA adapters, makes that restore raise
+            ``ValueError: Structure mismatch``), but IS active for the
+            init/param-merge below (so the new parameters actually end up in
+            the returned model).
 
     Returns:
         CustomAlphaGenomeModel with requested heads and pretrained backbone.
@@ -2384,6 +2397,16 @@ def create_model_with_heads(
                 f"Available heads: {custom_heads_module.list_registered_heads()}"
             )
 
+    if gradient_checkpointing:
+        # Unlike install_backbone_patches (LoRA), always safe to install
+        # eagerly, including before dna_model.create()'s own internal
+        # checkpoint restore below: hk.remat only wraps how a computation
+        # graph is executed, it never adds/renames/reshapes a parameter, so
+        # it can't make the restore target's structure mismatch the saved
+        # checkpoint the way adding new LoRA parameters does.
+        from alphagenome_ft.finegrained_remat import install_fine_grained_remat
+        install_fine_grained_remat()
+
     # Load pretrained model
     print("Loading pretrained AlphaGenome model...")
     if checkpoint_path is not None:
@@ -2400,6 +2423,9 @@ def create_model_with_heads(
             device=device,
         )
     print("✓ Pretrained model loaded")
+
+    if install_backbone_patches is not None:
+        install_backbone_patches()
 
     # Get metadata
     metadata = {}
@@ -2440,16 +2466,15 @@ def create_model_with_heads(
 
                         # Step 1: Run encoder ONLY
                         encoder = model_lib.SequenceEncoder()
-                        call_encoder = lambda seq: encoder(seq, is_training=False)
-                        if gradient_checkpointing:
-                            # hk.remat, not jax.checkpoint: this call is inside
-                            # a Haiku transform, and jax.checkpoint's re-trace
-                            # leaks a tracer out of Haiku's implicit RNG-key
-                            # threading (a Python-side mutable PRNGSequence),
-                            # raising UnexpectedTracerError. hk.remat is the
-                            # Haiku-aware equivalent.
-                            call_encoder = hk.remat(call_encoder)
-                        trunk, intermediates = call_encoder(dna_sequence)
+                        # Per-block hk.remat (installed below, once, when
+                        # gradient_checkpointing is on) already wraps
+                        # SequenceEncoder.__call__ internally at finer
+                        # granularity than an outer hk.remat here would -- see
+                        # finegrained_remat.py for why that granularity matters
+                        # (an outer whole-encoder remat alone isn't enough
+                        # memory headroom once the backbone isn't detached,
+                        # e.g. --mode lora).
+                        trunk, intermediates = encoder(dna_sequence, is_training=False)
                         encoder_output = trunk  # Save encoder output
 
                         # Create extended embeddings with ONLY encoder output
@@ -2488,13 +2513,14 @@ def create_model_with_heads(
             # is on, needlessly recomputing) those on every step.
             # forward_trunk is @hk.name_like('__call__'), so parameter paths
             # still match a checkpoint saved via the real __call__.
-            if gradient_checkpointing:
-                # hk.remat, not jax.checkpoint (see the encoder-only branch
-                # above for why): plain jax.checkpoint on a Haiku-bound call
-                # leaks a tracer from Haiku's implicit RNG threading.
-                embeddings = hk.remat(alphagenome.forward_trunk)(dna_sequence, organism_index)
-            else:
-                embeddings = alphagenome.forward_trunk(dna_sequence, organism_index)
+            # Per-block hk.remat (installed below, once, when
+            # gradient_checkpointing is on) already wraps the encoder/
+            # transformer-tower/decoder internally at finer granularity than
+            # an outer hk.remat around the whole forward_trunk call would --
+            # see finegrained_remat.py for why that granularity matters (an
+            # outer whole-trunk remat alone still OOM'd at ~53GB once the
+            # backbone isn't detached, e.g. --mode lora).
+            embeddings = alphagenome.forward_trunk(dna_sequence, organism_index)
             if detach_backbone:
                 embeddings = _stop_gradient_embeddings(embeddings)
 
@@ -2811,6 +2837,7 @@ def load_checkpoint(
     init_seq_len: int | None = None,
     detach_backbone: bool = False,
     gradient_checkpointing: bool = False,
+    install_backbone_patches: Callable[[], None] | None = None,
 ) -> CustomAlphaGenomeModel:
     """Load a saved head checkpoint.
 
@@ -2838,6 +2865,10 @@ def load_checkpoint(
         init_seq_len: Optional sequence length for model initialization. If None and
             use_encoder_output=True, will be inferred from checkpoint parameters.
             This is critical for encoder-only models with flatten pooling.
+        install_backbone_patches: See ``create_model_with_heads`` — forwarded
+            to the internal template-model construction so a resumed LoRA run
+            rebuilds the same LoRA-shaped target tree the checkpoint was
+            saved with.
 
     Returns:
         CustomAlphaGenomeModel with loaded parameters.
@@ -3005,6 +3036,7 @@ def load_checkpoint(
         detach_backbone=detach_backbone,
         gradient_checkpointing=gradient_checkpointing,
         init_seq_len=init_for_template,
+        install_backbone_patches=install_backbone_patches,
     )
     restore_target = template_model._checkpoint_slice_trees(
         save_full_model, save_minimal_model

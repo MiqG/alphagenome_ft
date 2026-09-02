@@ -258,6 +258,50 @@ class _HeadConfigEntry:
     config: Any
 
 
+def _partitioned_binary_crossentropy_usage_loss(
+    logits: jnp.ndarray,
+    targets: jnp.ndarray,
+    num_segments: int,
+) -> jnp.ndarray:
+    """JAX port of alphagenome-pytorch's `_partitioned_loss`, specialized to
+    the splice_site_usage BCE loss.
+
+    See alphagenome-pytorch/src/alphagenome_pytorch/extensions/finetuning/
+    training.py: `_partitioned_loss` (chunking/reduction) and
+    `_compute_splice_loss`'s `SpliceSitesUsageHead` `elif num_segments > 1`
+    branch (per-chunk loss_fn/mask_fn). Mirrored exactly, including the
+    PyTorch reference's own quirk of NOT applying the head's organism/track
+    padding mask in this branch (`mask=torch.ones_like(p, dtype=torch.bool)`)
+    -- only the sequence is partitioned, tracks are never masked here.
+
+    Splits `logits`/`targets` (both `(B, S, C)`) into `num_segments` equal
+    contiguous chunks along the sequence axis (axis=1; the last chunk absorbs
+    any remainder when `S` doesn't divide evenly), computes the elementwise
+    sigmoid BCE (alphagenome_research.model.losses.binary_crossentropy_from_
+    logits's exact formula) with a plain (unmasked) mean within each chunk,
+    then SUMS the per-chunk means -- not a single global mean -- which
+    upweights sparse splice-site regions relative to a flat reduction.
+    """
+    from alphagenome_research.model import losses as research_losses
+
+    seq_len = logits.shape[1]
+    chunk_size = seq_len // num_segments
+    chunk_losses = []
+    for i in range(num_segments):
+        start = i * chunk_size
+        end = start + chunk_size if i < num_segments - 1 else seq_len
+        logits_chunk = logits[:, start:end, :]
+        targets_chunk = targets[:, start:end, :]
+        chunk_losses.append(
+            research_losses.binary_crossentropy_from_logits(
+                y_pred=logits_chunk,
+                y_true=targets_chunk,
+                mask=jnp.ones_like(logits_chunk, dtype=bool),
+            )
+        )
+    return jnp.sum(jnp.stack(chunk_losses))
+
+
 class CustomAlphaGenomeModel:
     """Extended AlphaGenome model with custom/predefined head support and parameter freezing.
 
@@ -315,6 +359,11 @@ class CustomAlphaGenomeModel:
         self._output_metadata_by_organism = base_model._output_metadata_by_organism
         self._variant_scorers = base_model._variant_scorers
         self._head_configs = {}
+        # Per-head sequence-partition count for the splice_site_usage loss --
+        # see set_usage_num_segments() and create_loss_fn_for_head() below.
+        # Defaults to 1 (no partitioning, i.e. the predefined head's own
+        # single global masked mean) for any head never configured here.
+        self._usage_num_segments: dict[str, int] = {}
         if head_configs:
             for name, entry in head_configs.items():
                 if isinstance(entry, _HeadConfigEntry):
@@ -610,6 +659,29 @@ class CustomAlphaGenomeModel:
         entry = self._head_configs[head_name]
         return entry.config
 
+    def set_usage_num_segments(self, head_name: str, num_segments: int) -> None:
+        """Configure sequence-partitioned loss for a splice_site_usage head.
+
+        Ports alphagenome-pytorch's `_partitioned_loss` (see
+        extensions/finetuning/training.py, `_compute_splice_loss`'s
+        SpliceSitesUsageHead branch) for training parity: instead of the
+        predefined head's single global masked-mean BCE
+        (alphagenome_research.model.heads.SpliceSitesUsageHead.loss), the
+        sequence is split into `num_segments` equal contiguous chunks, BCE is
+        computed independently (masked mean) within each chunk, and the
+        per-chunk losses are SUMMED (not averaged) -- upweighting sparse
+        splice-site regions relative to a flat global mean, exactly matching
+        the PyTorch reference's reduction.
+
+        Defaults to 1 (no partitioning -- the original behavior) for any head
+        this is never called for. PyTorch's own default is `num_segments=8`;
+        pass that here for parity with a PyTorch run that has
+        `min_alpha_juncs=0` (which disables PyTorch's alternative
+        alpha-confidence-masking branch and falls through to this same
+        partitioned path -- see extensions/finetuning/training.py:570-596).
+        """
+        self._usage_num_segments[head_name] = num_segments
+
     def create_loss_fn_for_head(self, head_name: str):
         """Create a loss function for a head.
 
@@ -767,7 +839,22 @@ class CustomAlphaGenomeModel:
                     metadata=None,  # Use head's config metadata, not organism metadata
                     num_organisms=len(self._metadata)
                 )
-            loss_dict = head.loss(predictions, batch)
+            num_segments = self._usage_num_segments.get(head_name, 1)
+            if (
+                entry.source == 'predefined'
+                and head_type == research_heads_module.HeadType.SPLICE_SITES_USAGE
+                and num_segments > 1
+            ):
+                # Bypass the predefined head's own single-global-mean loss()
+                # -- see set_usage_num_segments() for why/what this mirrors.
+                logits = predictions['logits']
+                targets_clipped = jnp.clip(batch.splice_site_usage, 1e-7, 1.0 - 1e-7)
+                loss = _partitioned_binary_crossentropy_usage_loss(
+                    logits, targets_clipped, num_segments,
+                )
+                loss_dict = {'loss': loss}
+            else:
+                loss_dict = head.loss(predictions, batch)
             if head_loss_weight != 1.0:
                 loss_dict = {**loss_dict, 'loss': loss_dict['loss'] * head_loss_weight}
             return loss_dict
